@@ -165,3 +165,27 @@ async def test_the_prune_count_never_waits_for_the_write_lock(
         writer.rollback()
         writer.close()
     assert counts["noise_events"] == 0
+
+
+async def test_the_prune_count_matches_the_deletion_when_variants_have_copies(
+    repository: SQLiteEventRepository,
+) -> None:
+    # Measured on the real replay: copies of a story variant went with the variant, so the
+    # count (165,902 deleted) was 21,211 too high.
+    plain = "Another plain roadmap update with no quotable sentence."
+    variant = plain.replace(".", " today.")
+    await RadarPipeline(
+        collector=FakeCollector([x_item(4, plain), x_item(6, variant), x_item(9, variant)]),
+        ranker=DeterministicFixtureRanker(),
+        repository=repository,
+        filter_policy=FilterPolicy(max_age=timedelta(hours=1)),
+        thresholds=PipelineThresholds(archive=50, digest=90, urgent=95),
+    ).run_once()
+    assert table_sizes(repository)["content_mentions"] == 1  # 1009 is a copy of variant 1006
+    later = everything_older_than(datetime.now(UTC) + timedelta(days=1))
+
+    counted = await repository.prune(later, apply=False)
+    deleted = await repository.prune(later, apply=True)
+
+    assert counted == deleted
+    assert (counted["duplicate_texts"], counted["copy_mentions"]) == (1, 0)

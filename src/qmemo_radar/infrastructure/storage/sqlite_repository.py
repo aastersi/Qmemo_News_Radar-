@@ -1506,6 +1506,7 @@ class SQLiteEventRepository:
             WHERE m.seen_at < ? AND m.url != e.url
               AND NOT {_HUMAN.format(event="e.id")}
               AND (c.id IS NULL OR NOT {_HUMAN.format(event="c.representative_event_id")})
+              AND e.id NOT IN ({members})  -- those go with their variant, deleted first
         """
         statuses = ",".join(f"'{status.value}'" for status in _NOISE)
         # A row still referenced as the original of another stays; variants deleted above do not
@@ -1536,7 +1537,13 @@ class SQLiteEventRepository:
         index, kept = _iso(cutoffs.index_before), _iso(cutoffs.metrics_before)
         categories: tuple[tuple[str, str, tuple[str, ...], str | None, tuple[str, ...]], ...] = (
             ("duplicate_texts", members, (evidence,), "radar_events", ("id",)),
-            ("copy_mentions", copies, (evidence,), "content_mentions", ("event_id", "url")),
+            (
+                "copy_mentions",
+                copies,
+                (evidence, evidence),
+                "content_mentions",
+                ("event_id", "url"),
+            ),
             ("rejected_samples", samples, (noise,), "rejected_samples", ("id",)),
             ("stories", stories, (noise, evidence), None, ()),
             ("noise_events", noise_rows, (noise, evidence), "radar_events", ("id",)),
