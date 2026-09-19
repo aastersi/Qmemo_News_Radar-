@@ -15,6 +15,7 @@ from qmemo_radar.application.filtering import FilterPolicy
 from qmemo_radar.application.normalization import build_candidate
 from qmemo_radar.application.pipeline import PipelineThresholds, RadarPipeline
 from qmemo_radar.application.ports import SourceCollector
+from qmemo_radar.application.selection import SelectionPolicy
 from qmemo_radar.bootstrap import (
     SOURCE_REGISTRY,
     SourceContext,
@@ -76,7 +77,16 @@ def pipeline(collector: SourceCollector, repository: SQLiteEventRepository) -> R
         repository=repository,
         filter_policy=FilterPolicy(max_age=timedelta(hours=1)),
         thresholds=PipelineThresholds(),
+        # These tests are about sources: every stored story is ranked, none is preselected out.
+        selection=SelectionPolicy(min_preselect_score=0),
     )
+
+
+SELECTION_METRICS = {"clusters_created", "preselected", "near_duplicates", "same_event"}
+
+
+def _flow(values: Mapping[str, int]) -> dict[str, int]:
+    return {name: value for name, value in values.items() if name not in SELECTION_METRICS}
 
 
 def settings(**values: object) -> RadarSettings:
@@ -201,13 +211,28 @@ async def test_ingestion_metrics_per_source(
     with caplog.at_level("INFO"):
         second = await pipeline(collector, repository).run_once(run_id="run-2")
 
-    assert (first.collected, first.inserted, first.duplicates, first.filtered) == (8, 7, 3, 2)
+    # "Too short" is rejected by the gate before storage; the two copies of the shared text
+    # are mentions of its first row, not rows of their own.
+    assert (first.collected, first.inserted, first.duplicates, first.filtered) == (8, 4, 3, 2)
     assert (first.source_errors, first.scored) == (1, 3)
-    assert (second.collected, second.inserted, second.duplicates, second.filtered) == (8, 0, 8, 0)
-    assert await repository.metrics_since(datetime(2000, 1, 1, tzinfo=UTC)) == {
+    assert (second.collected, second.inserted, second.duplicates, second.filtered) == (8, 0, 7, 1)
+    metrics = await repository.metrics_since(datetime(2000, 1, 1, tzinfo=UTC))
+    assert {key: _flow(values) for key, values in metrics.items() if _flow(values)} == {
         "broken": {"source_errors": 2},
-        "gdelt:gqg": {"collected": 4, "exact_duplicates": 3, "inserted": 2},
-        "rss:wire": {"collected": 12, "exact_duplicates": 8, "filtered": 2, "inserted": 5},
+        "gdelt:gqg": {
+            "collected": 4,
+            "exact_duplicates": 3,
+            "inserted": 1,
+            "mentions_aggregated": 1,
+        },
+        "rss:wire": {
+            "collected": 12,
+            "exact_duplicates": 7,
+            "filtered": 1,
+            "inserted": 3,
+            "mentions_aggregated": 1,
+            "rejected_too_short": 2,
+        },
     }
     with sqlite3.connect(repository._db_path) as db:
         rows = db.execute(
@@ -217,18 +242,24 @@ async def test_ingestion_metrics_per_source(
     assert rows == [
         ("rss-1", "SHORTLISTED", None, 0),
         ("rss-2", "FILTERED_OUT", "too_old", 0),
-        ("rss-3", "FILTERED_OUT", "too_short", 0),
-        ("rss-4", "FILTERED_OUT", "duplicate_content", 1),
         ("rss-5", "SHORTLISTED", None, 0),
-        ("gdelt-1", "FILTERED_OUT", "duplicate_content", 1),
         ("gdelt-2", "SHORTLISTED", None, 0),
+    ]
+    with sqlite3.connect(repository._db_path) as db:
+        copies = db.execute(
+            "SELECT e.external_id, m.source_key, m.url FROM content_mentions m "
+            "JOIN radar_events e ON e.id = m.event_id WHERE m.url != e.url ORDER BY m.url"
+        ).fetchall()
+    assert copies == [
+        ("rss-1", "gdelt:gqg", "https://news.example/gdelt/1"),
+        ("rss-1", "rss:wire", "https://news.example/rss/4"),
     ]
     logged = {
         getattr(record, "source_key", None): getattr(record, "result", None)
         for record in caplog.records
         if record.getMessage() == "source collected"
     }
-    assert logged["rss:wire"] == "collected=6 exact_duplicates=6"
+    assert logged["rss:wire"] == "collected=6 rejected_too_short=1 exact_duplicates=5"
 
 
 async def test_collector_recovering_from_a_crash_clears_its_error(
@@ -314,13 +345,33 @@ async def test_upgrade_to_shared_quote_urls_keeps_rows_and_children(tmp_path: Pa
     with sqlite3.connect(path) as db:
         for migration in migrations:
             db.executescript(migration.read_text(encoding="utf-8"))
-    old = SQLiteEventRepository(path)
     first = build_candidate(article(SourceType.RSS, 1))
     copy = build_candidate(article(SourceType.RSS, 2)).model_copy(
         update={"duplicate_of_event_id": first.event_id}
     )
-    assert await old.add_events([first, copy]) == 2
     with sqlite3.connect(path) as db:
+        # Rows as the pre-M3 code wrote them: the current code writes columns 010 adds.
+        db.executemany(
+            "INSERT INTO radar_events (id, source, external_id, url, original_text,"
+            " normalized_text, content_hash, published_at, discovered_at, status, created_at,"
+            " updated_at, source_key, duplicate_of_event_id)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'DISCOVERED', 'now', 'now', 'rss:wire', ?)",
+            [
+                (
+                    event.event_id,
+                    event.source.value,
+                    event.external_id,
+                    str(event.url),
+                    event.original_text,
+                    event.normalized_text,
+                    event.content_hash,
+                    event.published_at.isoformat(),
+                    event.discovered_at.isoformat(),
+                    event.duplicate_of_event_id,
+                )
+                for event in (first, copy)
+            ],
+        )
         db.execute(
             "INSERT INTO feedback (event_id, action, telegram_user_id, created_at)"
             " VALUES (?, 'SKIP', 1, 'now')",
@@ -329,8 +380,8 @@ async def test_upgrade_to_shared_quote_urls_keeps_rows_and_children(tmp_path: Pa
 
     await SQLiteEventRepository(path).initialize()
 
-    with sqlite3.connect(path) as db:
-        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone() == (9,)
+    with sqlite3.connect(path) as db:  # 009 and 010 both apply to the old database
+        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone() == (10,)
         assert db.execute(
             "SELECT rowid, id, duplicate_of_event_id FROM radar_events ORDER BY rowid"
         ).fetchall() == [(1, first.event_id, None), (2, copy.event_id, first.event_id)]
@@ -449,7 +500,7 @@ async def test_a_free_source_backlog_does_not_starve_fresh_candidates(
     # backlog of thousands kept every new item from reaching the ranker.
     from qmemo_radar.exceptions import RankingFailed
 
-    earlier = datetime.now(UTC) - timedelta(hours=5)
+    earlier = datetime.now(UTC) - timedelta(hours=30)
     backlog = [
         build_candidate(article(SourceType.GDELT, n), discovered_at=earlier) for n in range(150)
     ]

@@ -1,3 +1,4 @@
+import re
 from datetime import time
 from decimal import Decimal
 from pathlib import Path
@@ -61,6 +62,11 @@ class RadarSettings(BaseSettings):
     # Noise (FILTERED_OUT, EXPIRED, ARCHIVED without any human action) older than this is
     # reported as prunable. Nothing is deleted automatically yet.
     raw_retention_days: int = Field(default=14, ge=7, le=365)
+    # Stored variants of a story and mentions of its exact copies: provenance while a story is
+    # live (clustering looks back 48 h), prunable after this. `qmemo-radar prune --apply` only.
+    retention_evidence_days: int = Field(default=7, ge=1, le=365)
+    # Flow counters (pipeline_metrics) and finished runs; the cost ledger is never pruned.
+    retention_metrics_days: int = Field(default=90, ge=30, le=3650)
 
     # Free sources: no key, no BudgetGuard. GDELT is off by default because it adds tens of
     # thousands of quotes per hour; RSS is on as soon as sources.yaml lists an enabled feed.
@@ -73,6 +79,9 @@ class RadarSettings(BaseSettings):
     # Comma-separated GDELT language names (e.g. English,Spanish), case-insensitive; * = all.
     gdelt_languages: str = "English"
     gdelt_allow_unknown_language: bool = False
+    # A minute failing (403, 5xx, network) in this many runs in a row is parked as a blocked gap,
+    # retried once per run and listed by `qmemo-radar gaps`; collection moves on meanwhile.
+    gdelt_block_after_failures: int = Field(default=3, ge=2, le=100)
     rss_max_response_bytes: int = Field(default=5_000_000, ge=10_000, le=5_000_000)
 
     @model_validator(mode="after")
@@ -192,6 +201,97 @@ class RssSources(_SourcesModel):
     feeds: tuple[RssFeed, ...] = ()
 
 
+# Generic page furniture that sometimes arrives as a "quote"; nothing topic-specific. Furniture
+# phrases ("read more", "sign up") count only when they open a short text: in real speech they
+# appear inside sentences (measured on the M4 replay: "...the option to sign up for...").
+DEFAULT_TEMPLATE_PATTERNS = (
+    r"^\W*(mon|tue|wed|thu|fri|sat|sun)[a-z]*,? \d{1,2} [a-z]{3,9},? \d{4}",
+    r"^\W*(click here|read more|continue reading|sign up|subscribe|log ?in|newsletter|"
+    r"all rights reserved|cookie policy|privacy policy|terms of (use|service))\b[^.!?]{0,60}\W*$",
+    r"(©|\(c\)|copyright)\s*(19|20)\d{2}",
+    r"^\W*(https?://|www\.)\S+\W*$",
+)
+
+
+class GateRules(_SourcesModel):
+    """Cheap rules applied before anything is stored; a rejected item leaves only a counter
+    (`rejected_<reason>`) and at most a small text sample for audit."""
+
+    min_words: int = Field(default=5, ge=1, le=50)
+    min_chars: int = Field(default=25, ge=1, le=500)
+    # Above any quote or feed entry (RSS: title 500 + summary 2,000): only junk is longer.
+    max_chars: int = Field(default=5_000, ge=100, le=50_000)
+    # Language names or codes (English, en); empty = any. Items without a language pass.
+    languages: tuple[str, ...] = ()
+    blocked_terms: tuple[str, ...] = ()
+    # A domain also blocks its subdomains.
+    blocked_domains: tuple[str, ...] = ()
+    template_patterns: tuple[str, ...] = DEFAULT_TEMPLATE_PATTERNS
+    # Share of letters among non-space characters; below it the text is mostly numbers/symbols.
+    min_letter_ratio: float = Field(default=0.6, ge=0, le=1)
+    # An article URL dated (/2023/05/02/) older than this is a republished old story.
+    max_url_age_days: int | None = Field(default=30, ge=1, le=3650)
+    # true: an item matching no topic below is rejected as off_topic.
+    require_topic: bool = False
+
+    @model_validator(mode="after")
+    def validate_patterns(self) -> "GateRules":
+        for pattern in self.template_patterns:
+            try:
+                re.compile(pattern)
+            except re.error as exc:
+                raise ValueError(f"invalid template pattern {pattern!r}: {exc}") from exc
+        return self
+
+
+class TopicRule(_SourcesModel):
+    name: str = Field(pattern=r"^[a-z0-9_]{1,40}$")
+    # Words or phrases, matched as whole words without regard to case.
+    terms: tuple[str, ...] = Field(min_length=1)
+    weight: int = Field(default=5, ge=1, le=10)
+
+
+class ClusteringRules(_SourcesModel):
+    """When two texts are one story. Doubt keeps them apart: a missed merge costs a second
+    card, a false merge hides a story."""
+
+    window_hours: int = Field(default=48, ge=1, le=720)
+    # Near duplicate: Jaccard similarity of the content words.
+    near_duplicate_jaccard: float = Field(default=0.8, ge=0.5, le=1)
+    # Share of the shorter text's content words found in the other one, for both kinds. 1.0:
+    # one text lies wholly inside the other (after the synonym map); lower allows swapped
+    # words, which also lets approve/block or five/ten through ...
+    same_event_overlap: float = Field(default=1.0, ge=0.5, le=1)
+    # ... and at least this many shared content words.
+    same_event_min_shared: int = Field(default=4, ge=2, le=20)
+
+
+class PreselectionRules(_SourcesModel):
+    # Clusters scoring below this are never ranked (0-100, same scale as the ranking total).
+    min_score: int = Field(default=55, ge=0, le=100)
+    # Sources whose items are ranked without preselection: already chosen by a person.
+    always_rank_sources: tuple[str, ...] = ("x",)
+    # One site repeating a text across many pages is page furniture, not a story.
+    boilerplate_min_mentions: int = Field(default=10, ge=2)
+    boilerplate_max_domains: int = Field(default=2, ge=1)
+
+
+class SelectionConfig(_SourcesModel):
+    gate: GateRules = GateRules()
+    topics: tuple[TopicRule, ...] = ()
+    clustering: ClusteringRules = ClusteringRules()
+    preselection: PreselectionRules = PreselectionRules()
+
+    @model_validator(mode="after")
+    def validate_topics(self) -> "SelectionConfig":
+        names = [topic.name for topic in self.topics]
+        if len(names) != len(set(names)):
+            raise ValueError("Topic names in sources.yaml must be unique")
+        if self.gate.require_topic and not self.topics:
+            raise ValueError("selection.gate.require_topic needs at least one topic")
+        return self
+
+
 class SourcesConfig(_SourcesModel):
     """Contents of sources.yaml: what to read and what to always drop."""
 
@@ -199,6 +299,7 @@ class SourcesConfig(_SourcesModel):
     rss: RssSources = RssSources()
     blocked_authors: tuple[str, ...] = ()
     blocked_terms: tuple[str, ...] = ()
+    selection: SelectionConfig = SelectionConfig()
 
     @model_validator(mode="after")
     def validate_unique_keys(self) -> "SourcesConfig":

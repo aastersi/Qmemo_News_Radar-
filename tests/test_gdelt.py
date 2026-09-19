@@ -5,6 +5,7 @@ import json
 import sqlite3
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
@@ -13,11 +14,22 @@ from qmemo_radar.application.collection import MultiSourceCollector
 from qmemo_radar.application.filtering import FilterPolicy
 from qmemo_radar.application.pipeline import PipelineThresholds, RadarPipeline
 from qmemo_radar.application.ports import SourceCollector
+from qmemo_radar.application.runner import StatusReport
+from qmemo_radar.domain import PipelineCounters
 from qmemo_radar.infrastructure.collectors import gdelt_gqg
-from qmemo_radar.infrastructure.collectors.gdelt_gqg import SOURCE_KEY, GdeltQuotationCollector
+from qmemo_radar.infrastructure.collectors.gdelt_gqg import (
+    SOURCE_KEY,
+    GdeltCursor,
+    GdeltQuotationCollector,
+)
 from qmemo_radar.infrastructure.storage import SQLiteEventRepository
+from qmemo_radar.interfaces.cli import execute
+from qmemo_radar.interfaces.telegram.render import status_text
 
 NOW = datetime(2026, 9, 16, 12, 30, 30, tzinfo=UTC)
+UTC_ZONE = ZoneInfo("UTC")
+# Counted by the selection stage after ingestion; the tests here are about the collector.
+SELECTION = {"clusters_created", "preselected", "near_duplicates", "same_event"}
 LAG = timedelta(minutes=10)  # newest minute ever requested: 12:20
 
 
@@ -42,8 +54,8 @@ def gz(*rows: object) -> bytes:
     return gzip.compress(b"\n".join(lines) + b"\n")
 
 
-FIRST = 'We will not raise taxes this year, whatever happens in parliament'
-SECOND = 'The budget is balanced for the first time in a decade and it stays so'
+FIRST = "We will not raise taxes this year, whatever happens in parliament"
+SECOND = "The budget is balanced for the first time in a decade and it stays so"
 SPANISH = "Una frase bastante larga para el radar"
 FRENCH = "Une phrase assez longue pour le radar"
 
@@ -93,6 +105,12 @@ def pipeline(collector: SourceCollector, repository: SQLiteEventRepository) -> R
     )
 
 
+async def cursor_of(repository: SQLiteEventRepository) -> tuple[str | None, int, object]:
+    state = GdeltCursor.parse((await repository.get_checkpoints()).get(SOURCE_KEY))
+    nxt = state.next.strftime("%Y%m%d%H%M%S") if state.next else None
+    return (nxt, state.attempts, state.blocked)
+
+
 def stored(repository: SQLiteEventRepository) -> list[tuple[object, ...]]:
     with sqlite3.connect(repository._db_path) as db:
         return db.execute(
@@ -120,21 +138,24 @@ async def test_quotes_of_a_file_are_stored_one_row_each_and_a_rerun_adds_nothing
 
     assert gdelt.requested[:3] == [minute("12:00"), minute("12:01"), minute("12:02")]
     assert gdelt.requested[20] == minute("12:20") and len(gdelt.requested) == 21
-    assert (first.collected, first.inserted, first.duplicates, first.source_errors) == (3, 3, 1, 0)
+    assert (first.collected, first.inserted, first.duplicates, first.source_errors) == (3, 2, 1, 0)
     assert [row[:4] for row in rows] == [
         ("https://news.example/a", FIRST, None, "ENGLISH"),
         ("https://news.example/a", SECOND, None, "ENGLISH"),
-        ("https://news.example/b", FIRST, None, "ENGLISH"),
     ]
+    # The same quote in article b is provenance of the first row, not a second copy of it.
+    with sqlite3.connect(repository._db_path) as db:
+        mentions = db.execute(
+            "SELECT e.original_text, m.url, m.domain FROM content_mentions m "
+            "JOIN radar_events e ON e.id = m.event_id ORDER BY e.rowid, m.url"
+        ).fetchall()
+    assert mentions == [(FIRST, "https://news.example/b", "news.example")]
     assert rows[0][4] == "2026-09-16T12:05:59+00:00"
+    # Only what the columns lack: the quote, URL, language and date are columns already.
     assert json.loads(str(rows[0][5])) == {
         "title": "Budget",
         "pre": "The minister said ",
-        "quote": FIRST,
         "post": " on Monday.",
-        "url": "https://news.example/a",
-        "lang": "ENGLISH",
-        "date": "2026-09-16T12:05:59Z",
         "gqg_file": minute("12:05"),
     }
     # The cursor is the next minute to check; the rerun starts there and finds nothing new.
@@ -143,14 +164,15 @@ async def test_quotes_of_a_file_are_stored_one_row_each_and_a_rerun_adds_nothing
     assert len(gdelt.requested) == 21  # 12:21 is still inside the safety window
 
     metrics = await repository.metrics_since(datetime(2000, 1, 1, tzinfo=UTC))
-    assert metrics[SOURCE_KEY] == {
+    assert {k: v for k, v in metrics[SOURCE_KEY].items() if k not in SELECTION} == {
         "articles_seen": 2,
         "collected": 3,
         "exact_duplicates": 1,
         "expected_gaps": 20,
         "files_checked": 21,
         "files_found": 1,
-        "inserted": 3,
+        "inserted": 2,
+        "mentions_aggregated": 1,
         "quotes_accepted": 3,
         "quotes_seen": 3,
     }
@@ -216,12 +238,12 @@ async def test_a_failing_minute_is_retried_never_skipped(
     retries = gdelt.requested.count(minute("12:04"))
     assert (first.inserted, first.source_errors) == (1, 1)
     # Progress up to the failure is kept, the failing minute becomes the cursor.
-    assert await repository.get_checkpoints() == {SOURCE_KEY: minute("12:04")}
+    assert await cursor_of(repository) == (minute("12:04"), 1, {})
     assert minute("12:05") not in gdelt.requested
 
     second = await pipeline(gdelt.collector(), repository).run_once()
     assert gdelt.requested.count(minute("12:04")) == 2 * retries
-    assert await repository.get_checkpoints() == {SOURCE_KEY: minute("12:04")}
+    assert await cursor_of(repository) == (minute("12:04"), 2, {})
     [health] = [h for h in await repository.source_health() if h.source_key == SOURCE_KEY]
     # No progress in the second run, so the failures keep counting up.
     assert (health.last_error, health.consecutive_failures) == (code, 2)
@@ -262,7 +284,8 @@ async def test_malformed_rows_and_filtered_languages_are_counted_and_skipped(
     assert counters.inserted == 1 and counters.source_errors == 0
     metrics = await repository.metrics_since(datetime(2000, 1, 1, tzinfo=UTC))
     counted = metrics[SOURCE_KEY]
-    assert {k: v for k, v in counted.items() if k not in {"files_checked", "expected_gaps"}} == {
+    skip = {"files_checked", "expected_gaps", *SELECTION}
+    assert {k: v for k, v in counted.items() if k not in skip} == {
         "articles_language_skipped": 2,
         "articles_seen": 5,
         "collected": 1,
@@ -482,3 +505,159 @@ def test_gdelt_must_check_at_least_one_collection_interval_per_run() -> None:
             collect_interval_minutes=90,
         )
     RadarSettings(_env_file=None, collect_interval_minutes=90)  # type: ignore[call-arg]
+
+
+async def test_a_permanently_failing_minute_becomes_a_visible_blocked_gap(
+    repository: SQLiteEventRepository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Regression: one minute answering 403 forever stopped the cursor forever.
+    gdelt = Gdelt(
+        {
+            minute("12:04"): 403,
+            minute("12:06"): gz(article("https://news.example/b", SECOND)),
+        }
+    )
+    for _ in range(2):  # below the threshold: the cursor waits on 12:04
+        await pipeline(gdelt.collector(), repository).run_once()
+    assert await cursor_of(repository) == (minute("12:04"), 2, {})
+
+    third = await pipeline(gdelt.collector(), repository).run_once()
+    nxt, attempts, blocked = await cursor_of(repository)
+    assert (nxt, attempts, third.inserted, third.source_errors) == (minute("12:21"), 0, 1, 0)
+    assert blocked == {
+        minute("12:04"): {"reason": "gdelt_http_403", "attempts": 3, "since": NOW.isoformat()}
+    }
+
+    [health] = [h for h in await repository.source_health() if h.source_key == SOURCE_KEY]
+    assert (health.blocked_gaps, health.consecutive_failures) == (1, 0)
+    report = StatusReport(
+        paused=False,
+        heartbeat_at=None,
+        last_run=None,
+        last_success=None,
+        sources=[health],
+        today=PipelineCounters(),
+        sent_today=0,
+        outbox_approved=0,
+        qmemo_publishing_enabled=False,
+        x_publishing_enabled=False,
+    )
+    assert "gdelt:gqg: работает; заблокировано минут: 1" in status_text(report, timezone=UTC_ZONE)
+
+    # Every later run gives it exactly one more try; the data is never silently dropped.
+    before = gdelt.requested.count(minute("12:04"))
+    await pipeline(gdelt.collector(), repository).run_once()
+    assert gdelt.requested.count(minute("12:04")) == before + 1
+    assert (await cursor_of(repository))[2][minute("12:04")]["attempts"] == 4
+
+    gdelt.files[minute("12:04")] = gz(article("https://news.example/late", FIRST))
+    recovered = await pipeline(gdelt.collector(), repository).run_once()
+    assert recovered.inserted == 1
+    assert await cursor_of(repository) == (minute("12:21"), 0, {})
+    metrics = await repository.metrics_since(datetime(2000, 1, 1, tzinfo=UTC))
+    assert (metrics[SOURCE_KEY]["gaps_blocked"], metrics[SOURCE_KEY]["gaps_recovered"]) == (1, 1)
+
+
+async def test_an_outage_fills_the_blocked_list_then_stops_visibly(
+    repository: SQLiteEventRepository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(gdelt_gqg, "MAX_BLOCKED_MINUTES", 1)
+    gdelt = Gdelt({minute(f"12:{m:02d}"): 503 for m in range(21)})
+    for _ in range(3):
+        await pipeline(gdelt.collector(), repository).run_once()
+    assert await cursor_of(repository) == (minute("12:01"), 1, {minute("12:00"): ANY_ENTRY})
+
+    for _ in range(2):
+        last = await pipeline(gdelt.collector(), repository).run_once()
+    # 12:01 reached the threshold, but the list is full: the collector stops and says why.
+    assert await cursor_of(repository) == (minute("12:01"), 3, {minute("12:00"): ANY_ENTRY})
+    health = {item.source_key: item for item in await repository.source_health()}
+    assert health[SOURCE_KEY].last_error == "gdelt_blocked_gaps_full"
+    assert last.source_errors == 1
+
+
+async def test_the_gaps_command_lists_and_skips_blocked_minutes_on_request(
+    repository: SQLiteEventRepository, capsys: pytest.CaptureFixture[str]
+) -> None:
+    gdelt = Gdelt({minute("12:04"): 403})
+    for _ in range(3):
+        await pipeline(gdelt.collector(), repository).run_once()
+
+    assert await execute("gaps", db_path=repository._db_path) == 0
+    listed = json.loads(capsys.readouterr().out)
+    assert list(listed["blocked"]) == [minute("12:04")] and listed["skipped_now"] == []
+
+    assert await execute("gaps", db_path=repository._db_path, skip=["all"]) == 0
+    done = json.loads(capsys.readouterr().out)
+    assert (done["blocked"], done["skipped_now"]) == ({}, [minute("12:04")])
+    assert done["skipped_before"][minute("12:04")]["reason"] == "gdelt_http_403"
+    assert await cursor_of(repository) == (minute("12:21"), 0, {})
+    # Skipped means skipped: the next run does not request it again.
+    before = gdelt.requested.count(minute("12:04"))
+    await pipeline(gdelt.collector(), repository).run_once()
+    assert gdelt.requested.count(minute("12:04")) == before
+
+
+def test_skipping_a_blocked_minute_keeps_a_record() -> None:
+    state = GdeltCursor.parse(
+        '{"next": "20260916122100", "attempts": 0, "blocked": {"20260916120400":'
+        ' {"reason": "gdelt_http_403", "attempts": 7, "since": "x"}}, "skipped": {}}'
+    )
+    assert state.skip(["20260916120400", "20260916120500"], at=NOW) == ["20260916120400"]
+    again = GdeltCursor.parse(state.dump())
+    assert again.blocked == {}
+    assert again.skipped["20260916120400"]["skipped_at"] == NOW.isoformat()
+    assert again.skipped["20260916120400"]["reason"] == "gdelt_http_403"
+    # A plain cursor from before blocked gaps existed still reads, and writes back unchanged.
+    assert GdeltCursor.parse("20260916122100").dump() == "20260916122100"
+
+
+class _Any:
+    def __eq__(self, other: object) -> bool:
+        return True
+
+
+ANY_ENTRY = _Any()
+
+
+async def test_one_permanently_blocked_minute_does_not_hold_up_the_others(
+    repository: SQLiteEventRepository,
+) -> None:
+    # Independent review: retries stopped at the first failure, so a minute failing forever
+    # kept every later blocked minute from ever being retried.
+    blocked = {
+        minute("12:00"): {"reason": "gdelt_http_403", "attempts": 3, "since": "x"},
+        minute("12:01"): {"reason": "gdelt_server_error", "attempts": 3, "since": "x"},
+    }
+    await repository.record_source_result(
+        SOURCE_KEY,
+        cursor=GdeltCursor(next=datetime(2026, 9, 16, 12, 21, tzinfo=UTC), blocked=blocked).dump(),
+        error_code=None,
+    )
+    gdelt = Gdelt(
+        {minute("12:00"): 403, minute("12:01"): gz(article("https://news.example/late", FIRST))}
+    )
+
+    counters = await pipeline(gdelt.collector(), repository).run_once()
+
+    assert counters.inserted == 1
+    assert list((await cursor_of(repository))[2]) == [minute("12:00")]
+
+
+async def test_an_outage_ends_the_retries_of_blocked_minutes_for_the_run(
+    repository: SQLiteEventRepository,
+) -> None:
+    blocked = {
+        minute(f"12:0{n}"): {"reason": "gdelt_server_error", "attempts": 3, "since": "x"}
+        for n in range(3)
+    }
+    await repository.record_source_result(
+        SOURCE_KEY,
+        cursor=GdeltCursor(next=datetime(2026, 9, 16, 12, 21, tzinfo=UTC), blocked=blocked).dump(),
+        error_code=None,
+    )
+    gdelt = Gdelt({minute(f"12:0{n}"): 503 for n in range(3)})
+
+    await pipeline(gdelt.collector(), repository).run_once()
+
+    assert [gdelt.requested.count(minute(f"12:0{n}")) for n in range(3)] == [1, 0, 0]

@@ -23,7 +23,8 @@ import json
 import logging
 import zlib
 from collections import Counter
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
 from typing import Any
@@ -46,6 +47,11 @@ MAX_LINE_BYTES = 4 * 1024 * 1024
 MAX_ARTICLES_PER_FILE = 100_000
 MAX_QUOTE_CHARS = 2_000
 _CONTEXT_CHARS = 500
+# Blocked minutes are retried every run; this bounds that work and turns a long outage into a
+# visible stop (gdelt_blocked_gaps_full) instead of an ever-growing list.
+MAX_BLOCKED_MINUTES = 30
+MAX_SKIPPED_RECORDS = 200
+_OUTAGE = frozenset({"gdelt_network_error", "gdelt_server_error", "gdelt_rate_limited"})
 
 
 class GdeltQuotationCollector:
@@ -58,6 +64,7 @@ class GdeltQuotationCollector:
         first_run_lookback: timedelta,
         languages: frozenset[str] | None,
         allow_unknown_language: bool,
+        block_after_failures: int = 3,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         sleep: Sleep = asyncio.sleep,
     ) -> None:
@@ -67,52 +74,130 @@ class GdeltQuotationCollector:
         self._lookback = first_run_lookback
         self._languages = languages
         self._allow_unknown = allow_unknown_language
+        self._block_after = block_after_failures
         self._clock = clock
         self._sleep = sleep
 
     async def collect(self, checkpoints: Mapping[str, str]) -> list[SourceFetch]:
         now = self._clock()
         newest = _floor_minute(now - self._safety_lag)
-        start = _parse_cursor(checkpoints.get(SOURCE_KEY)) or _floor_minute(now - self._lookback)
-        minute = start
+        state = GdeltCursor.parse(checkpoints.get(SOURCE_KEY))
+        start = state.next or _floor_minute(now - self._lookback)
+        state.next = start
         stats: Counter[str] = Counter()
         fetches: list[SourceFetch] = []
         if start > _floor_minute(now):
             # The clock went back or the cursor is corrupt: idling silently would look healthy.
-            return _stop(fetches, start, minute, stats, "gdelt_cursor_ahead")
+            return self._stop(fetches, state, start, start, stats, "gdelt_cursor_ahead")
+        await self._retry_blocked(state, fetches, stats)
+
+        minute = start
         while minute <= newest and stats["files_checked"] < self._max_minutes:
             stats["files_checked"] += 1
-            try:
-                response, body = await get_limited(
-                    self._http,
-                    FILE_URL.format(minute=minute),
-                    max_bytes=MAX_COMPRESSED_BYTES,
-                    sleep=self._sleep,
-                )
-            except HttpFailure as exc:
-                if exc.code != "response_too_large":
-                    return _stop(fetches, start, minute, stats, f"gdelt_{exc.code}")
-                stats["files_oversized"] += 1
-                _warn("gdelt file too large", minute, exc.code)
-                minute += _MINUTE
-                continue
-            if response.status_code == 404:
-                if self._too_new_for_server(minute, response):
-                    # Our clock runs ahead of GDELT's: this file may still appear, so no gap.
-                    return _stop(fetches, start, minute, stats, "gdelt_clock_ahead")
-                stats["expected_gaps"] += 1
-            elif response.status_code == 200:
-                stats["files_found"] += 1
-                items, file_stats = await asyncio.to_thread(self._parse, body, minute)
-                stats.update(file_stats)
-                cursor = _cursor(minute + _MINUTE)
-                fetches.append(SourceFetch(source_key=SOURCE_KEY, items=items, cursor=cursor))
-            else:
-                code = f"gdelt_http_{response.status_code}"
-                return _stop(fetches, start, minute, stats, code)
+            outcome = await self._check(minute, stats)
+            if isinstance(outcome, str):
+                if outcome == "gdelt_clock_ahead":
+                    # Our clock runs ahead of the GDELT clock: the file may still appear, no gap.
+                    return self._stop(fetches, state, start, minute, stats, outcome)
+                attempts = state.attempts + 1 if minute == start else 1
+                if attempts < self._block_after or len(state.blocked) >= MAX_BLOCKED_MINUTES:
+                    state.attempts = attempts
+                    code = outcome if attempts < self._block_after else "gdelt_blocked_gaps_full"
+                    return self._stop(fetches, state, start, minute, stats, code)
+                # Failed in `attempts` runs in a row: park it, visibly, and keep collecting.
+                state.blocked[_cursor(minute)] = {
+                    "reason": outcome,
+                    "attempts": attempts,
+                    "since": now.isoformat(),
+                }
+                stats["gaps_blocked"] += 1
+                _warn("gdelt minute blocked", minute, outcome)
+            elif outcome is not None:
+                fetches.append(self._fetch(state, minute + _MINUTE, outcome))
             minute += _MINUTE
-        fetches.append(SourceFetch(source_key=SOURCE_KEY, cursor=_cursor(minute), stats=stats))
+        state.next, state.attempts = minute, 0
+        fetches.append(SourceFetch(source_key=SOURCE_KEY, cursor=state.dump(), stats=stats))
         return fetches
+
+    async def _retry_blocked(
+        self, state: "GdeltCursor", fetches: list[SourceFetch], stats: Counter[str]
+    ) -> None:
+        """One attempt per blocked minute and run. An outage (network, 5xx, 429) ends the retries
+        for this run; a minute failing on its own (403, other 4xx) does not hold up the rest."""
+        for name in sorted(state.blocked):
+            minute = _parse_minute(name)
+            outcome = await self._check(minute, stats, attempts=1) if minute else None
+            if isinstance(outcome, str):
+                state.blocked[name]["attempts"] = int(state.blocked[name].get("attempts", 0)) + 1
+                if outcome in _OUTAGE:
+                    return
+                continue
+            del state.blocked[name]
+            stats["gaps_recovered"] += 1
+            # Saved with its items: the minute leaves the list only once they are stored.
+            fetches.append(
+                SourceFetch(source_key=SOURCE_KEY, items=outcome or (), cursor=state.dump())
+            )
+
+    def _fetch(
+        self, state: "GdeltCursor", next_minute: datetime | None, items: tuple[RawSourceItem, ...]
+    ) -> SourceFetch:
+        state.next, state.attempts = next_minute, 0
+        return SourceFetch(source_key=SOURCE_KEY, items=items, cursor=state.dump())
+
+    async def _check(
+        self, minute: datetime, stats: Counter[str], *, attempts: int = 3
+    ) -> tuple[RawSourceItem, ...] | str | None:
+        """Items of a found file, None for a gap, or the error code of a failed minute."""
+        try:
+            response, body = await get_limited(
+                self._http,
+                FILE_URL.format(minute=minute),
+                max_bytes=MAX_COMPRESSED_BYTES,
+                attempts=attempts,
+                sleep=self._sleep,
+            )
+        except HttpFailure as exc:
+            if exc.code != "response_too_large":
+                return f"gdelt_{exc.code}"
+            stats["files_oversized"] += 1
+            _warn("gdelt file too large", minute, exc.code)
+            return None
+        if response.status_code == 404:
+            if self._too_new_for_server(minute, response):
+                return "gdelt_clock_ahead"
+            stats["expected_gaps"] += 1
+            return None
+        if response.status_code != 200:
+            return f"gdelt_http_{response.status_code}"
+        stats["files_found"] += 1
+        items, file_stats = await asyncio.to_thread(self._parse, body, minute)
+        stats.update(file_stats)
+        return items
+
+    def _stop(
+        self,
+        fetches: list[SourceFetch],
+        state: "GdeltCursor",
+        start: datetime,
+        minute: datetime,
+        stats: Counter[str],
+        code: str,
+    ) -> list[SourceFetch]:
+        """Save the progress before `minute` (gaps included), report the error, retry it next run.
+
+        Without progress no success is recorded, so a minute that keeps failing shows a growing
+        consecutive_failures in /status instead of resetting it every run. The error still
+        carries the cursor: failed attempts and blocked minutes must survive the run.
+        """
+        _warn("gdelt file failed", minute, code)
+        attempts = state.attempts
+        moved = [self._fetch(state, minute, ())] if minute > start else []
+        state.next, state.attempts = minute, attempts
+        error = SourceFetch(
+            source_key=SOURCE_KEY, error_code=code, stats=stats, cursor=state.dump()
+        )
+        return [*fetches, *moved, error]
 
     def _too_new_for_server(self, minute: datetime, response: httpx.Response) -> bool:
         try:
@@ -229,14 +314,11 @@ class GdeltQuotationCollector:
                 language=lang,
                 # When GDELT processed the article, not when the outlet published it.
                 published_at=published_at,
+                # Only what the columns lack: quote, URL, language and date are stored there.
                 raw_payload={
                     "title": _context(record.get("title")),
                     "pre": _context(quote.get("pre")),
-                    "quote": text,
                     "post": _context(quote.get("post")),
-                    "url": url,
-                    "lang": lang,
-                    "date": record.get("date"),
                     "gqg_file": name,
                 },
                 source_key=SOURCE_KEY,
@@ -249,19 +331,6 @@ class GdeltQuotationCollector:
 _MINUTE = timedelta(minutes=1)
 
 
-def _stop(
-    fetches: list[SourceFetch], start: datetime, minute: datetime, stats: Counter[str], code: str
-) -> list[SourceFetch]:
-    """Save the progress before `minute` (gaps included), report the error, retry it next run.
-
-    Without progress no success is recorded, so a minute that keeps failing shows a growing
-    consecutive_failures in /status instead of resetting it every run.
-    """
-    _warn("gdelt file failed", minute, code)
-    moved = [SourceFetch(source_key=SOURCE_KEY, cursor=_cursor(minute))] if minute > start else []
-    return [*fetches, *moved, SourceFetch(source_key=SOURCE_KEY, error_code=code, stats=stats)]
-
-
 def _floor_minute(moment: datetime) -> datetime:
     return moment.astimezone(UTC).replace(second=0, microsecond=0)
 
@@ -270,17 +339,78 @@ def _cursor(minute: datetime) -> str:
     return minute.strftime(_CURSOR_FORMAT)
 
 
-def _parse_cursor(value: str | None) -> datetime | None:
-    if not value:
-        return None
+def _parse_minute(value: str) -> datetime | None:
     try:
         return _floor_minute(datetime.strptime(value, _CURSOR_FORMAT).replace(tzinfo=UTC))
     except ValueError:
-        logger.warning(
-            "gdelt cursor invalid, starting from the lookback window",
-            extra={"operation": "collect", "source_key": SOURCE_KEY, "error_code": "bad_cursor"},
-        )
         return None
+
+
+@dataclass
+class GdeltCursor:
+    """`YYYYMMDDHHMMSS` while nothing failed; JSON once attempts or blocked minutes exist.
+
+    blocked: minutes that failed in `block_after_failures` runs in a row. Each is retried once per
+    run until it loads, or until an operator skips it (`qmemo-radar gaps --skip`); `skipped` keeps
+    that record. Nothing leaves `blocked` silently.
+    """
+
+    next: datetime | None = None
+    attempts: int = 0
+    blocked: dict[str, dict[str, Any]] = field(default_factory=dict)
+    skipped: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+    @classmethod
+    def parse(cls, value: str | None) -> "GdeltCursor":
+        if not value:
+            return cls()
+        try:
+            if not value.startswith("{"):
+                parsed = _parse_minute(value)
+                if parsed is None:
+                    raise ValueError(value)
+                return cls(next=parsed)
+            data = json.loads(value)
+            return cls(
+                next=_parse_minute(str(data["next"])) if data.get("next") else None,
+                attempts=int(data.get("attempts", 0)),
+                blocked=dict(data.get("blocked") or {}),
+                skipped=dict(data.get("skipped") or {}),
+            )
+        except (ValueError, TypeError, KeyError, AttributeError):
+            logger.warning(
+                "gdelt cursor invalid, starting from the lookback window",
+                extra={
+                    "operation": "collect",
+                    "source_key": SOURCE_KEY,
+                    "error_code": "bad_cursor",
+                },
+            )
+            return cls()
+
+    def dump(self) -> str | None:
+        next_minute = _cursor(self.next) if self.next else None
+        if not (self.attempts or self.blocked or self.skipped):
+            return next_minute
+        # The newest skip records only: an audit trail, not a growing table.
+        skipped = dict(sorted(self.skipped.items())[-MAX_SKIPPED_RECORDS:])
+        data = {
+            "next": next_minute,
+            "attempts": self.attempts,
+            "blocked": self.blocked,
+            "skipped": skipped,
+        }
+        return json.dumps(data, sort_keys=True)
+
+    def skip(self, minutes: Iterable[str], *, at: datetime) -> list[str]:
+        """Give up on blocked minutes; returns the ones that were blocked."""
+        done = []
+        for name in minutes:
+            entry = self.blocked.pop(name, None)
+            if entry is not None:
+                self.skipped[name] = {**entry, "skipped_at": at.isoformat()}
+                done.append(name)
+        return done
 
 
 def _context(value: object) -> str | None:

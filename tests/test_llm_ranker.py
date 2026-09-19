@@ -151,8 +151,9 @@ async def test_fixture_priorities_filters_and_batches(repository: SQLiteEventRep
     assert (counters.scored, counters.rank_failed) == (23, 0)
     reasons = dict(rows(repository, "SELECT external_id, filter_reason FROM radar_events"))
     assert reasons["old-1"] == "too_old"
-    assert reasons["duplicate-1"] == "duplicate_content"
-    assert reasons["noise-1"] == "too_short"
+    assert "duplicate-1" not in reasons  # an identical text: a mention, not a row
+    assert rows(repository, "SELECT COUNT(*) FROM content_mentions") == [(1,)]
+    assert "noise-1" not in reasons  # rejected by the gate before storage
     assert reasons["strong-1"] is None
 
     totals = dict(

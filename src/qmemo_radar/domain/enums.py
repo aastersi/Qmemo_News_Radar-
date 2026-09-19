@@ -29,7 +29,9 @@ class Metric(StrEnum):
     FILTERED = "filtered"  # rejected by deterministic rules
     SOURCE_ERRORS = "source_errors"
     INVALID_ITEMS = "invalid_items"  # could not be normalized or stored (e.g. broken Unicode)
-    # Reserved names for the future preselection chain; nothing records them yet.
+    # An exact copy of a stored text, kept as a mention of it instead of a row.
+    MENTIONS_AGGREGATED = "mentions_aggregated"
+    # Selection (M4). Gate rejections are recorded as rejected_<reason>.
     NEAR_DUPLICATES = "near_duplicates"
     CLUSTERS_CREATED = "clusters_created"
     CLUSTERS_MERGED = "clusters_merged"
@@ -65,7 +67,6 @@ class OutboxStatus(StrEnum):
 class FactCheckStatus(StrEnum):
     VERIFIED = "VERIFIED"
     NEEDS_REVIEW = "NEEDS_REVIEW"
-
 
 
 class DeliveryKind(StrEnum):

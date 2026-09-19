@@ -50,3 +50,39 @@ blocked_authors: []
 blocked_terms:
   - giveaway
   - airdrop
+
+# Отбор (M4): что сохранять, что считать одной историей, что ранжировать. Всё бесплатно и локально.
+# Без этой секции действуют значения ниже.
+selection:
+  # Фильтр до записи: отброшенное не сохраняется, остаются счётчик и небольшой пример
+  # (qmemo-radar rejected).
+  gate:
+    min_words: 5
+    min_chars: 25
+    max_chars: 5000
+    languages: []            # например [English, en]; пусто — любой; без языка — пропускается
+    blocked_terms: []
+    blocked_domains: []      # домен блокирует и свои поддомены
+    min_letter_ratio: 0.6    # доля букв среди непробельных символов
+    max_url_age_days: 30     # статья с датой в URL старше — перепечатка старого
+    require_topic: false     # true — без совпадения с темой ниже текст отбрасывается
+    # template_patterns: свои регулярные выражения вместо встроенных (даты, "click here"...)
+
+  # Темы: слова и фразы целиком, без учёта регистра. Совпадение добавляет вес к значимости.
+  topics:
+    - name: ai
+      terms: [artificial intelligence, openai, chatgpt]
+      weight: 5
+
+  # Когда два текста — одна история. При сомнении — раздельно.
+  clustering:
+    window_hours: 48
+    near_duplicate_jaccard: 0.8   # почти дубликат: доля общих значимых слов
+    same_event_overlap: 1.0       # доля слов короткого текста в длинном (1.0 — целиком внутри)
+    same_event_min_shared: 4
+
+  preselection:
+    min_score: 55                 # ниже — история не ранжируется (0-100, шкала ранжирования)
+    always_rank_sources: [x]      # источники, выбранные человеком: без преселекции
+    boilerplate_min_mentions: 10  # один сайт повторяет текст на многих страницах — шаблон
+    boilerplate_max_domains: 2

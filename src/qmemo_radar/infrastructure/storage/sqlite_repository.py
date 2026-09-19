@@ -2,14 +2,25 @@ import json
 import sqlite3
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import ROUND_CEILING, Decimal
 from importlib.resources import files
 from pathlib import Path
 
 import aiosqlite
 
-from qmemo_radar.application.ports import KnownEvents
+from qmemo_radar.application.filtering import ITEM_REASONS
+from qmemo_radar.application.normalization import comparison_text
+from qmemo_radar.application.ports import (
+    ClusterJoin,
+    ClusterScore,
+    KnownEvents,
+    Mention,
+    PruneCutoffs,
+    RejectedSample,
+    Representative,
+)
+from qmemo_radar.application.selection import ClusterSignals, article_of, domain_of
 from qmemo_radar.domain import (
     SHARED_URL_SOURCES,
     CostEntry,
@@ -44,9 +55,9 @@ _INSERT_EVENT = """
         author_display_name, original_text, normalized_text,
         content_hash, language, published_at, discovered_at,
         engagement_json, raw_payload_json, status, created_at, updated_at,
-        source_key, filter_reason, duplicate_of_event_id
+        source_key, filter_reason, domain, article, duplicate_of_event_id
     ) VALUES (
-        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
         -- NULL instead of a foreign-key error when the original was ignored as a duplicate
         -- (e.g. a manual link stored it between find_known and this insert).
         (SELECT id FROM radar_events WHERE id = ?)
@@ -89,14 +100,51 @@ class SQLiteEventRepository:
     async def add_event(self, event: EventCandidate) -> bool:
         return await self.add_events([event]) == 1
 
-    async def add_events(self, events: Sequence[EventCandidate]) -> int:
-        if not events:
+    async def add_events(
+        self, events: Sequence[EventCandidate], mentions: Sequence[Mention] = ()
+    ) -> int:
+        if not events and not mentions:
             return 0
         now = datetime.now(UTC).isoformat()
         async with self._transaction() as db:
             before = db.total_changes
             await db.executemany(_INSERT_EVENT, [_event_row(event, now) for event in events])
-            return db.total_changes - before
+            inserted = db.total_changes - before
+            if not mentions:
+                return inserted
+            await db.executemany(
+                """
+                INSERT OR IGNORE INTO content_mentions (
+                    event_id, url, domain, article, source_key, seen_at
+                )
+                SELECT ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM radar_events WHERE id = ?)
+                """,
+                [
+                    (
+                        m.event_id,
+                        m.url,
+                        m.domain,
+                        m.article,
+                        m.source_key,
+                        _iso(m.seen_at),
+                        m.event_id,
+                    )
+                    for m in mentions
+                ],
+            )
+            owners = sorted({mention.event_id for mention in mentions})
+            for chunk in _chunks(owners):
+                await db.execute(
+                    f"""
+                    UPDATE event_clusters SET preselect_score = -1
+                    WHERE id IN (
+                        SELECT cluster_id FROM radar_events
+                        WHERE id IN ({_placeholders(chunk)}) AND cluster_id IS NOT NULL
+                    )
+                    """,
+                    chunk,
+                )
+            return inserted
 
     async def find_known(self, events: Sequence[EventCandidate]) -> KnownEvents:
         by_source: dict[str, list[EventCandidate]] = {}
@@ -130,37 +178,35 @@ class SQLiteEventRepository:
                     f"""
                     SELECT content_hash, id, MIN(rowid) FROM radar_events
                     WHERE content_hash IN ({_placeholders(hashes)})
-                      AND COALESCE(filter_reason, '') != 'duplicate_content'
+                      AND COALESCE(filter_reason, '') NOT IN ({_placeholders(_NOT_OWNERS)})
                     GROUP BY content_hash
                     """,
-                    hashes,
+                    [*hashes, *_NOT_OWNERS],
                 )
                 owners = {str(row[0]): str(row[1]) for row in rows}
-        return KnownEvents(ids=frozenset(ids), urls=frozenset(urls), content_owners=owners)
-
-    async def count_prunable_noise(self, discovered_before: datetime) -> dict[str, int]:
-        values = [status.value for status in _NOISE]
-        async with self._connect() as db:
-            rows = await db.execute_fetchall(
-                f"""
-                SELECT e.status, COUNT(*) FROM radar_events e
-                WHERE e.status IN ({_placeholders(values)}) AND e.discovered_at < ?
-                  AND NOT EXISTS (SELECT 1 FROM telegram_deliveries d WHERE d.event_id = e.id)
-                  AND NOT EXISTS (SELECT 1 FROM drafts r WHERE r.event_id = e.id)
-                  AND NOT EXISTS (SELECT 1 FROM feedback f WHERE f.event_id = e.id)
-                  AND NOT EXISTS (SELECT 1 FROM publication_outbox o WHERE o.event_id = e.id)
-                  AND NOT EXISTS (
-                      SELECT 1 FROM radar_events c WHERE c.duplicate_of_event_id = e.id
-                  )
-                GROUP BY e.status
-                """,
-                (*values, discovered_before.astimezone(UTC).isoformat()),
+            pairs = sorted(
+                {
+                    (owners[event.content_hash], str(event.url))
+                    for event in events
+                    if event.content_hash in owners
+                }
             )
-        return {str(status): int(count) for status, count in rows}
+            mentioned: set[tuple[str, str]] = set()
+            for chunk in _chunks(pairs):
+                found = await db.execute_fetchall(
+                    f"SELECT event_id, url FROM content_mentions WHERE (event_id, url) IN "
+                    f"(VALUES {','.join('(?, ?)' for _ in chunk)})",
+                    [value for pair in chunk for value in pair],
+                )
+                mentioned.update((str(row[0]), str(row[1])) for row in found)
+        return KnownEvents(
+            ids=frozenset(ids),
+            urls=frozenset(urls),
+            content_owners=owners,
+            mentions=frozenset(mentioned),
+        )
 
-    async def record_metrics(
-        self, run_id: str, metrics: Mapping[str, Mapping[str, int]]
-    ) -> None:
+    async def record_metrics(self, run_id: str, metrics: Mapping[str, Mapping[str, int]]) -> None:
         now = datetime.now(UTC).isoformat()
         rows = [
             (run_id, source_key, str(metric), value, now)
@@ -366,28 +412,30 @@ class SQLiteEventRepository:
                 await db.execute(
                     """
                     INSERT INTO source_checkpoints (
-                        source_key, last_error_at, last_error, consecutive_failures
-                    ) VALUES (?, ?, ?, 1)
+                        source_key, cursor_value, last_error_at, last_error, consecutive_failures
+                    ) VALUES (?, ?, ?, ?, 1)
                     ON CONFLICT(source_key) DO UPDATE SET
+                        cursor_value = COALESCE(excluded.cursor_value, cursor_value),
                         last_error_at = excluded.last_error_at,
                         last_error = excluded.last_error,
                         consecutive_failures = consecutive_failures + 1
                     """,
-                    (source_key, now, error_code),
+                    (source_key, cursor, now, error_code),
                 )
             await db.commit()
 
     async def has_earlier_content_duplicate(self, event: EventCandidate) -> bool:
         async with self._connect() as db:
+            # The same owner rule as find_known: an earlier row filtered for its item is no owner.
             rows = await db.execute_fetchall(
-                """
+                f"""
                 SELECT 1 FROM radar_events
                 WHERE content_hash = ?
                   AND rowid < (SELECT rowid FROM radar_events WHERE id = ?)
-                  AND COALESCE(filter_reason, '') != 'duplicate_content'
+                  AND COALESCE(filter_reason, '') NOT IN ({_placeholders(_NOT_OWNERS)})
                 LIMIT 1
                 """,
-                (event.content_hash, event.event_id),
+                (event.content_hash, event.event_id, *_NOT_OWNERS),
             )
         return bool(rows)
 
@@ -960,9 +1008,566 @@ class SQLiteEventRepository:
         async with self._connect() as db:
             rows = await db.execute_fetchall("SELECT * FROM source_checkpoints ORDER BY source_key")
         return [
-            SourceHealth.model_validate({k: v for k, v in dict(row).items() if k != "cursor_value"})
+            SourceHealth.model_validate(
+                {k: v for k, v in dict(row).items() if k != "cursor_value"}
+                | {"blocked_gaps": _blocked_gaps(row["cursor_value"])}
+            )
             for row in rows
         ]
+
+    async def edit_cursor(
+        self, source_key: str, edit: Callable[[str | None], str | None]
+    ) -> str | None:
+        """Read-modify-write one cursor in a single write transaction (operator commands)."""
+        async with self._transaction() as db:
+            rows = list(
+                await db.execute_fetchall(
+                    "SELECT cursor_value FROM source_checkpoints WHERE source_key = ?",
+                    (source_key,),
+                )
+            )
+            value = edit(str(rows[0][0]) if rows and rows[0][0] is not None else None)
+            await db.execute(
+                "UPDATE source_checkpoints SET cursor_value = ? WHERE source_key = ?",
+                (value, source_key),
+            )
+        return value
+
+    # --- selection: mentions, rejected samples, clusters -------------------------------------
+
+    async def add_rejected_samples(self, samples: Sequence[RejectedSample]) -> None:
+        if not samples:
+            return
+        async with self._transaction() as db:
+            await db.executemany(
+                "INSERT INTO rejected_samples (reason, source_key, text, url, seen_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                [
+                    (s.reason, s.source_key, s.text[:REJECTED_TEXT_CHARS], s.url, _iso(s.seen_at))
+                    for s in samples
+                ],
+            )
+            # A sample, not a log: only the newest rows per reason are kept.
+            for reason in {sample.reason for sample in samples}:
+                await db.execute(
+                    """
+                    DELETE FROM rejected_samples WHERE reason = ? AND id <= (
+                        SELECT id FROM rejected_samples WHERE reason = ?
+                        ORDER BY id DESC LIMIT 1 OFFSET ?
+                    )
+                    """,
+                    (reason, reason, REJECTED_SAMPLES_PER_REASON),
+                )
+
+    async def unclustered_events(self, *, limit: int) -> list[EventCandidate]:
+        async with self._connect() as db:
+            rows = await db.execute_fetchall(
+                """
+                SELECT * FROM radar_events INDEXED BY idx_events_unclustered
+                WHERE cluster_id IS NULL AND status = 'DISCOVERED'
+                  AND COALESCE(source_key, '') != 'manual'
+                ORDER BY discovered_at, rowid LIMIT ?
+                """,
+                (limit,),
+            )
+        return [self._event_from_row(row) for row in rows]
+
+    async def representatives(
+        self, band_keys: Sequence[int], *, seen_since: datetime
+    ) -> dict[int, list[Representative]]:
+        found: dict[int, list[Representative]] = {}
+        async with self._connect() as db:
+            for chunk in _chunks(sorted(set(band_keys))):
+                rows = await db.execute_fetchall(
+                    f"""
+                    SELECT k.band_key, c.id, e.id, e.original_text, e.language
+                    FROM cluster_keys k
+                    JOIN event_clusters c ON c.id = k.cluster_id
+                    JOIN radar_events e ON e.id = c.representative_event_id
+                    WHERE k.band_key IN ({_placeholders(chunk)}) AND c.last_seen_at >= ?
+                    """,
+                    (*chunk, _iso(seen_since)),
+                )
+                for key, cluster_id, event_id, text, language in rows:
+                    found.setdefault(int(key), []).append(
+                        Representative(int(cluster_id), str(event_id), str(text), language)
+                    )
+        return found
+
+    async def save_clustering(
+        self,
+        new_clusters: Sequence[tuple[EventCandidate, Sequence[int]]],
+        joins: Sequence[ClusterJoin],
+        *,
+        now: datetime,
+    ) -> int:
+        stamp = _iso(now)
+        # One statement per kind of row, not per story: a round trip costs more than the insert.
+        async with self._transaction() as db:
+            await db.executemany(
+                """
+                INSERT INTO event_clusters (
+                    representative_event_id, language, first_seen_at, last_seen_at,
+                    created_at, updated_at, article
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        event.event_id,
+                        event.language,
+                        _iso(event.discovered_at),
+                        _iso(event.discovered_at),
+                        stamp,
+                        stamp,
+                        article_of(event),
+                    )
+                    for event, _ in new_clusters
+                ],
+            )
+            await db.executemany(
+                f"UPDATE radar_events SET cluster_id = ({_CLUSTER_OF}), updated_at = ? "
+                "WHERE id = ?",
+                [(event.event_id, stamp, event.event_id) for event, _ in new_clusters],
+            )
+            await db.executemany(
+                f"INSERT OR IGNORE INTO cluster_keys (band_key, cluster_id) "
+                f"SELECT ?, ({_CLUSTER_OF})",
+                [(key, event.event_id) for event, keys in new_clusters for key in keys],
+            )
+            before = db.total_changes
+            await db.executemany(
+                f"""
+                UPDATE radar_events SET
+                    cluster_id = ({_CLUSTER_OF}), status = ?, filter_reason = ?,
+                    duplicate_of_event_id = ?, updated_at = ?
+                WHERE id = ? AND status = ? AND cluster_id IS NULL
+                """,
+                [
+                    (
+                        join.representative_event_id,
+                        EventStatus.FILTERED_OUT.value,
+                        join.reason,
+                        join.representative_event_id,
+                        stamp,
+                        join.event_id,
+                        EventStatus.DISCOVERED.value,
+                    )
+                    for join in joins
+                ],
+            )
+            attached = db.total_changes - before
+            await db.executemany(
+                "UPDATE event_clusters SET preselect_score = -1 WHERE representative_event_id = ?",
+                [
+                    (representative,)
+                    for representative in {j.representative_event_id for j in joins}
+                ],
+            )
+            return attached
+
+    async def clusters_of(self, event_ids: Sequence[str]) -> set[int]:
+        found: set[int] = set()
+        async with self._connect() as db:
+            for chunk in _chunks(sorted(set(event_ids))):
+                rows = await db.execute_fetchall(
+                    f"SELECT DISTINCT cluster_id FROM radar_events "
+                    f"WHERE id IN ({_placeholders(chunk)}) AND cluster_id IS NOT NULL",
+                    chunk,
+                )
+                found.update(int(row[0]) for row in rows)
+        return found
+
+    async def unscored_clusters(self, *, limit: int) -> set[int]:
+        async with self._connect() as db:
+            rows = await db.execute_fetchall(
+                "SELECT id FROM event_clusters INDEXED BY idx_clusters_dirty "
+                "WHERE preselect_score = -1 ORDER BY id LIMIT ?",
+                (limit,),
+            )
+        return {int(row[0]) for row in rows}
+
+    async def refresh_clusters(
+        self, cluster_ids: Sequence[int], *, now: datetime
+    ) -> list[ClusterSignals]:
+        stamp = _iso(now)
+        async with self._transaction() as db:
+            for chunk in _chunks(sorted(set(cluster_ids))):
+                sightings = _SIGHTINGS.format(clusters=_placeholders(chunk))
+                await db.execute(
+                    f"""
+                    UPDATE event_clusters SET
+                        mention_count = a.mentions, domain_count = a.domains,
+                        article_count = a.articles,
+                        source_count = a.sources, member_count = a.members,
+                        first_seen_at = a.first_seen, last_seen_at = a.last_seen, updated_at = ?
+                    FROM (
+                        SELECT cluster AS id, COUNT(*) AS mentions,
+                               COUNT(DISTINCT domain) AS domains,
+                               COUNT(DISTINCT article) AS articles,
+                               COUNT(DISTINCT COALESCE(source_key, '')) AS sources,
+                               COUNT(DISTINCT text_id) AS members,
+                               MIN(seen_at) AS first_seen, MAX(seen_at) AS last_seen
+                        FROM ({sightings}) GROUP BY cluster
+                    ) AS a
+                    WHERE event_clusters.id = a.id
+                    """,
+                    (stamp, *chunk, *chunk),
+                )
+        return await self._signals("c.id", cluster_ids, now=now)
+
+    async def cluster_signals(
+        self, event_ids: Sequence[str], *, now: datetime
+    ) -> list[ClusterSignals]:
+        return await self._signals("c.representative_event_id", event_ids, now=now)
+
+    async def _signals(
+        self, column: str, values: Sequence[str | int], *, now: datetime
+    ) -> list[ClusterSignals]:
+        hour_ago = _iso(now - timedelta(hours=1))
+        result: list[ClusterSignals] = []
+        async with self._connect() as db:
+            for chunk in _chunks(sorted(set(values), key=str)):
+                rows = list(
+                    await db.execute_fetchall(
+                        f"""
+                        SELECT e.*, c.id AS c_id, c.state AS c_state, c.mention_count,
+                               c.domain_count,
+                               c.article_count, c.source_count, c.member_count, c.first_seen_at
+                        FROM event_clusters c
+                        JOIN radar_events e ON e.id = c.representative_event_id
+                        WHERE {column} IN ({_placeholders(chunk)})
+                        """,
+                        chunk,
+                    )
+                )
+                ids = [int(row["c_id"]) for row in rows]
+                recent: dict[int, int] = {}
+                domains: dict[int, list[str]] = {}
+                for part in _chunks(ids):
+                    sightings = _SIGHTINGS.format(clusters=_placeholders(part))
+                    for cluster, count in await db.execute_fetchall(
+                        # Distinct articles, not sightings: a burst of reprints is one article.
+                        f"SELECT cluster, COUNT(DISTINCT article) FROM ({sightings}) "
+                        f"WHERE seen_at >= ? GROUP BY cluster",
+                        (*part, *part, hour_ago),
+                    ):
+                        recent[int(cluster)] = int(count)
+                    for cluster, domain in await db.execute_fetchall(
+                        f"SELECT cluster, domain FROM ({sightings}) WHERE domain IS NOT NULL "
+                        f"GROUP BY cluster, domain ORDER BY cluster, COUNT(*) DESC, domain",
+                        (*part, *part),
+                    ):
+                        domains.setdefault(int(cluster), []).append(str(domain))
+                for row in rows:
+                    cluster_id = int(row["c_id"])
+                    result.append(
+                        ClusterSignals(
+                            event=self._event_from_row(row),
+                            cluster_id=cluster_id,
+                            mentions=int(row["mention_count"]),
+                            domains=int(row["domain_count"]),
+                            articles=int(row["article_count"]),
+                            sources=int(row["source_count"]),
+                            members=int(row["member_count"]),
+                            first_seen=datetime.fromisoformat(row["first_seen_at"]),
+                            articles_last_hour=recent.get(cluster_id, 0),
+                            sample_domains=tuple(domains.get(cluster_id, [])[:3]),
+                            state=str(row["c_state"]),
+                        )
+                    )
+        return result
+
+    async def save_preselection(self, scores: Sequence[ClusterScore]) -> None:
+        if not scores:
+            return
+        async with self._transaction() as db:
+            await db.executemany(
+                """
+                UPDATE event_clusters SET state = ?, preselect_score = ?, preselect_json = ?
+                WHERE id = ?
+                """,
+                [
+                    (
+                        score.state,
+                        score.score,
+                        json.dumps(score.details, ensure_ascii=False),
+                        score.cluster_id,
+                    )
+                    for score in scores
+                ],
+            )
+
+    async def preselected_articles(self, articles: Sequence[str]) -> dict[str, int]:
+        found: dict[str, int] = {}
+        async with self._connect() as db:
+            for chunk in _chunks(sorted(set(articles))):
+                rows = await db.execute_fetchall(
+                    f"""
+                    SELECT article, MIN(id) FROM event_clusters
+                    WHERE state = 'preselected' AND article IN ({_placeholders(chunk)})
+                    GROUP BY article
+                    """,
+                    chunk,
+                )
+                found.update((str(article), int(cluster)) for article, cluster in rows)
+        return found
+
+    async def reopen_archived(self, event_ids: Sequence[str]) -> int:
+        reopened = 0
+        async with self._transaction() as db:
+            for chunk in _chunks(sorted(set(event_ids))):
+                # Only a ranking archived these; anything a person touched has another status.
+                cursor = await db.execute(
+                    f"""
+                    UPDATE radar_events SET status = ?, updated_at = ?
+                    WHERE id IN ({_placeholders(chunk)}) AND status = ?
+                      AND NOT EXISTS (SELECT 1 FROM feedback f WHERE f.event_id = radar_events.id)
+                    """,
+                    (
+                        EventStatus.DISCOVERED.value,
+                        _iso(datetime.now(UTC)),
+                        *chunk,
+                        EventStatus.ARCHIVED.value,
+                    ),
+                )
+                reopened += cursor.rowcount
+        return reopened
+
+    async def rank_candidates(self, *, limit: int) -> list[EventCandidate]:
+        async with self._connect() as db:
+            rows = await db.execute_fetchall(
+                """
+                SELECT * FROM (
+                    SELECT e.*, 1000 AS priority, e.rowid AS position FROM radar_events e
+                    WHERE e.status = 'DISCOVERED' AND e.source_key = 'manual'
+                    UNION ALL
+                    SELECT e.*, c.preselect_score AS priority, e.rowid AS position
+                    FROM event_clusters c
+                    JOIN radar_events e ON e.id = c.representative_event_id
+                    WHERE c.state = 'preselected' AND e.status = 'DISCOVERED'
+                )
+                ORDER BY priority DESC, position DESC LIMIT ?
+                """,
+                (limit,),
+            )
+        return [self._event_from_row(row) for row in rows]
+
+    # --- audit (read-only) and retention -----------------------------------------------------
+
+    @asynccontextmanager
+    async def _read(self) -> AsyncIterator[aiosqlite.Connection]:
+        """Read-only connection for audit commands: can neither migrate nor change anything."""
+        async with aiosqlite.connect(f"{self._db_path.resolve().as_uri()}?mode=ro", uri=True) as db:
+            db.row_factory = aiosqlite.Row
+            yield db
+
+    async def list_clusters(
+        self, *, limit: int, state: str | None, order: str
+    ) -> list[dict[str, object]]:
+        orders = {
+            "score": "c.preselect_score DESC, c.domain_count DESC",
+            "mentions": "c.mention_count DESC",
+            "recent": "c.id DESC",
+        }
+        async with self._read() as db:
+            rows = await db.execute_fetchall(
+                f"""
+                SELECT c.id, c.state, c.preselect_score, c.mention_count, c.domain_count,
+                       c.article_count, c.source_count, c.member_count, c.first_seen_at,
+                       c.last_seen_at,
+                       e.status, e.original_text, e.url, e.source_key,
+                       s.total AS rank_total
+                FROM event_clusters c
+                JOIN radar_events e ON e.id = c.representative_event_id
+                LEFT JOIN event_scores s ON s.event_id = e.id
+                WHERE (? IS NULL OR c.state = ?)
+                ORDER BY {orders[order]} LIMIT ?
+                """,
+                (state, state, limit),
+            )
+        return [dict(row) for row in rows]
+
+    async def cluster_detail(self, cluster_id: int, *, limit: int) -> dict[str, object] | None:
+        async with self._read() as db:
+            found = list(
+                await db.execute_fetchall(
+                    """
+                    SELECT c.*, e.original_text, e.url, e.status, e.source_key,
+                           s.total AS rank_total, s.rationale AS rank_rationale
+                    FROM event_clusters c
+                    JOIN radar_events e ON e.id = c.representative_event_id
+                    LEFT JOIN event_scores s ON s.event_id = e.id
+                    WHERE c.id = ?
+                    """,
+                    (cluster_id,),
+                )
+            )
+            if not found:
+                return None
+            members = await db.execute_fetchall(
+                """
+                SELECT id, source_key, status, filter_reason, original_text, url, discovered_at
+                FROM radar_events WHERE cluster_id = ? ORDER BY rowid LIMIT ?
+                """,
+                (cluster_id, limit),
+            )
+            sightings = _SIGHTINGS.format(clusters="?")
+            mentions = await db.execute_fetchall(
+                f"SELECT domain, url, source_key, seen_at, text_id FROM ({sightings}) "
+                f"ORDER BY seen_at LIMIT ?",
+                (cluster_id, cluster_id, limit),
+            )
+            domains = await db.execute_fetchall(
+                f"SELECT domain, COUNT(*) AS mentions FROM ({sightings}) "
+                f"GROUP BY domain ORDER BY mentions DESC, domain LIMIT ?",
+                (cluster_id, cluster_id, limit),
+            )
+        detail = dict(found[0])
+        detail["preselect"] = json.loads(str(detail.pop("preselect_json")))
+        detail["members"] = [dict(row) for row in members]
+        detail["mentions"] = [dict(row) for row in mentions]
+        detail["domains"] = {str(row[0]): int(row[1]) for row in domains}
+        return detail
+
+    async def rejected_samples(self, *, reason: str | None, limit: int) -> list[dict[str, object]]:
+        async with self._read() as db:
+            rows = await db.execute_fetchall(
+                """
+                SELECT reason, source_key, text, url, seen_at FROM rejected_samples
+                WHERE (? IS NULL OR reason = ?) ORDER BY RANDOM() LIMIT ?
+                """,
+                (reason, reason, limit),
+            )
+        return [dict(row) for row in rows]
+
+    async def selection_counts(self) -> dict[str, dict[str, int]]:
+        """Current state of stored stories and events, for `qmemo-radar funnel`."""
+        async with self._read() as db:
+            clusters = await db.execute_fetchall(
+                "SELECT state, COUNT(*) FROM event_clusters GROUP BY state"
+            )
+            multi = await db.execute_fetchall(
+                """
+                SELECT SUM(member_count > 1), SUM(domain_count > 1), SUM(mention_count),
+                       COUNT(*) FROM event_clusters
+                """
+            )
+            events = await db.execute_fetchall(
+                "SELECT status, COUNT(*) FROM radar_events GROUP BY status"
+            )
+            reasons = await db.execute_fetchall(
+                """
+                SELECT COALESCE(filter_reason, ''), COUNT(*) FROM radar_events
+                WHERE status = 'FILTERED_OUT' GROUP BY 1
+                """
+            )
+            ranked = await db.execute_fetchall(
+                """
+                SELECT e.status, COUNT(*) FROM event_scores s
+                JOIN radar_events e ON e.id = s.event_id GROUP BY e.status
+                """
+            )
+        [(with_texts, with_domains, mentions, total)] = list(multi)
+        return {
+            "clusters_by_state": {str(state): int(count) for state, count in clusters},
+            "clusters": {
+                "total": int(total or 0),
+                "with_several_texts": int(with_texts or 0),
+                "with_several_domains": int(with_domains or 0),
+                "mentions": int(mentions or 0),
+            },
+            "events_by_status": {str(status): int(count) for status, count in events},
+            "filtered_by_reason": {str(reason): int(count) for reason, count in reasons},
+            "ranked_by_status": {str(status): int(count) for status, count in ranked},
+        }
+
+    async def prune(self, cutoffs: PruneCutoffs, *, apply: bool) -> dict[str, int]:
+        """Counts (and with apply=True deletes) what retention allows, per category.
+
+        Never touched: anything a person saw or acted on (Telegram delivery, draft, feedback,
+        outbox package), the stories and copies of such events, and everything newer than the
+        cutoffs. Deleting an event deletes its score, mentions and, for a representative, its
+        story (foreign keys). The count only reads; deleting goes in short transactions of
+        PRUNE_BATCH rows, so a running collection is never locked out for long.
+        """
+        evidence = _iso(cutoffs.evidence_before)
+        noise = _iso(cutoffs.noise_before)
+        members = f"""
+            SELECT e.id FROM radar_events e
+            JOIN event_clusters c ON c.id = e.cluster_id
+            WHERE e.filter_reason IN ('near_duplicate', 'same_event')
+              AND e.discovered_at < ? AND NOT {_HUMAN.format(event="e.id")}
+              AND NOT {_HUMAN.format(event="c.representative_event_id")}
+        """
+        copies = f"""
+            SELECT m.event_id, m.url FROM content_mentions m
+            JOIN radar_events e ON e.id = m.event_id
+            LEFT JOIN event_clusters c ON c.id = e.cluster_id
+            WHERE m.seen_at < ? AND m.url != e.url
+              AND NOT {_HUMAN.format(event="e.id")}
+              AND (c.id IS NULL OR NOT {_HUMAN.format(event="c.representative_event_id")})
+              AND e.id NOT IN ({members})  -- those go with their variant, deleted first
+        """
+        statuses = ",".join(f"'{status.value}'" for status in _NOISE)
+        # A row still referenced as the original of another stays; variants deleted above do not
+        # count (the count, which deletes nothing, must see what the deletion will see).
+        noise_rows = f"""
+            SELECT e.id FROM radar_events e
+            WHERE e.status IN ({statuses}) AND e.discovered_at < ?
+              AND COALESCE(e.filter_reason, '') NOT IN ('near_duplicate', 'same_event')
+              AND NOT {_HUMAN.format(event="e.id")}
+              AND NOT EXISTS (
+                  SELECT 1 FROM radar_events x WHERE x.duplicate_of_event_id = e.id
+                  AND x.id NOT IN ({members})
+              )
+        """
+        stories = f"""
+            SELECT c.id FROM event_clusters c WHERE c.representative_event_id IN ({noise_rows})
+        """
+        samples = "SELECT id FROM rejected_samples WHERE seen_at < ?"
+        # Keys only find stories active within the clustering window, so older keys are dead
+        # weight; the keys of stories deleted with their representative go too (no foreign key).
+        stale_keys = """
+            SELECT band_key, cluster_id FROM cluster_keys WHERE cluster_id NOT IN (
+                SELECT id FROM event_clusters WHERE last_seen_at >= ?
+            )
+        """
+        metrics = "SELECT run_id, source_key, metric FROM pipeline_metrics WHERE recorded_at < ?"
+        runs = "SELECT id FROM pipeline_runs WHERE started_at < ? AND status != 'RUNNING'"
+        index, kept = _iso(cutoffs.index_before), _iso(cutoffs.metrics_before)
+        categories: tuple[tuple[str, str, tuple[str, ...], str | None, tuple[str, ...]], ...] = (
+            ("duplicate_texts", members, (evidence,), "radar_events", ("id",)),
+            (
+                "copy_mentions",
+                copies,
+                (evidence, evidence),
+                "content_mentions",
+                ("event_id", "url"),
+            ),
+            ("rejected_samples", samples, (noise,), "rejected_samples", ("id",)),
+            ("stories", stories, (noise, evidence), None, ()),
+            ("noise_events", noise_rows, (noise, evidence), "radar_events", ("id",)),
+            ("band_keys", stale_keys, (index,), "cluster_keys", ("band_key", "cluster_id")),
+            ("metrics", metrics, (kept,), "pipeline_metrics", ("run_id", "source_key", "metric")),
+            ("runs", runs, (kept,), "pipeline_runs", ("id",)),
+        )
+        counts: dict[str, int] = {}
+        for name, query, values, table, key in categories:
+            async with self._connect() as db:
+                keys = [tuple(row) for row in await db.execute_fetchall(query, values)]
+            counts[name] = len(keys)
+            if not apply or table is None:
+                continue
+            columns = f"({', '.join(key)})" if len(key) > 1 else key[0]
+            for start in range(0, len(keys), PRUNE_BATCH):
+                chunk = keys[start : start + PRUNE_BATCH]
+                rows = ",".join(f"({', '.join('?' for _ in key)})" for _ in chunk)
+                async with self._transaction() as db:
+                    await db.execute(
+                        f"DELETE FROM {table} WHERE {columns} IN (VALUES {rows})",
+                        [value for row in chunk for value in row],
+                    )
+        return counts
 
     @classmethod
     def _scored_from_row(cls, row: aiosqlite.Row) -> ScoredEvent:
@@ -999,7 +1604,8 @@ class SQLiteEventRepository:
                 "author_handle": values["author_handle"],
                 "author_display_name": values["author_display_name"],
                 "original_text": values["original_text"],
-                "normalized_text": values["normalized_text"],
+                "normalized_text": values["normalized_text"]
+                or comparison_text(values["original_text"]),
                 "content_hash": values["content_hash"],
                 "language": values["language"],
                 "published_at": values["published_at"],
@@ -1034,12 +1640,50 @@ class SQLiteEventRepository:
             await db.execute("PRAGMA foreign_keys = ON")
             await db.execute("PRAGMA busy_timeout = 5000")
             await db.execute("PRAGMA synchronous = NORMAL")
+            # 64 MB page cache instead of 2 MB: batched inserts into large random-key indexes
+            # (event ids, mentions) measured 3-5x faster at a few hundred thousand rows.
+            await db.execute("PRAGMA cache_size = -65536")
             yield db
         finally:
             await db.close()
 
 
 _MICROS = 1_000_000
+REJECTED_TEXT_CHARS = 300
+# Rows deleted per prune transaction: the write lock is held for well under a second.
+PRUNE_BATCH = 1_000
+# Rows that never own a text: legacy copies, and texts filtered for the item, not the text.
+_NOT_OWNERS = ("duplicate_content", *sorted(ITEM_REASONS))
+# Every sighting of the stories in {clusters}: each stored text at its own URL, and each exact
+# copy of it elsewhere. Columns: cluster, text, domain, source key, time.
+_SIGHTINGS = """
+    SELECT e.cluster_id AS cluster, e.id AS text_id, e.domain AS domain,
+           e.source_key AS source_key, e.discovered_at AS seen_at, e.url AS url,
+           e.article AS article
+    FROM radar_events e WHERE e.cluster_id IN ({clusters})
+    UNION ALL
+    SELECT e.cluster_id, m.event_id, m.domain, m.source_key, m.seen_at, m.url, m.article
+    FROM content_mentions m JOIN radar_events e ON e.id = m.event_id
+    WHERE e.cluster_id IN ({clusters})
+"""
+_HUMAN = """EXISTS (
+    SELECT 1 FROM telegram_deliveries d WHERE d.event_id = {event}
+    UNION ALL SELECT 1 FROM drafts r WHERE r.event_id = {event}
+    UNION ALL SELECT 1 FROM feedback f WHERE f.event_id = {event}
+    UNION ALL SELECT 1 FROM publication_outbox o WHERE o.event_id = {event}
+)"""
+_CLUSTER_OF = "SELECT id FROM event_clusters WHERE representative_event_id = ?"
+REJECTED_SAMPLES_PER_REASON = 500
+# SQLite accepts 32k bound parameters; far below that keeps every IN list cheap to plan.
+_CHUNK = 500
+
+
+def _iso(moment: datetime) -> str:
+    return moment.astimezone(UTC).isoformat()
+
+
+def _chunks[T](values: Sequence[T]) -> list[Sequence[T]]:
+    return [values[index : index + _CHUNK] for index in range(0, len(values), _CHUNK)]
 
 
 def _micros(usd: Decimal) -> int:
@@ -1057,7 +1701,8 @@ def _event_row(event: EventCandidate, now: str) -> tuple[object, ...]:
         event.author_handle,
         event.author_display_name,
         event.original_text,
-        event.normalized_text,
+        # Derived from original_text on read (comparison_text): storing it doubled the text.
+        "",
         event.content_hash,
         event.language,
         event.published_at.isoformat(),
@@ -1069,11 +1714,24 @@ def _event_row(event: EventCandidate, now: str) -> tuple[object, ...]:
         now,
         event.source_key,
         event.filter_reason,
+        domain_of(str(event.url)),
+        article_of(event),
         event.duplicate_of_event_id,
     )
 
 
-def _placeholders(values: Sequence[str]) -> str:
+def _blocked_gaps(cursor: object) -> int:
+    """A source keeps parked failures under `blocked` in a JSON cursor (see GdeltCursor)."""
+    if not isinstance(cursor, str) or not cursor.startswith("{"):
+        return 0
+    try:
+        blocked = json.loads(cursor).get("blocked")
+    except (ValueError, AttributeError):
+        return 0
+    return len(blocked) if isinstance(blocked, dict) else 0
+
+
+def _placeholders(values: Sequence[object]) -> str:
     return ",".join("?" for _ in values)
 
 

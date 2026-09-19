@@ -261,14 +261,25 @@ def status_text(report: StatusReport, *, timezone: ZoneInfo) -> str:
         "Последний успешный сбор: "
         + (_when(success.started_at, timezone) if success else "ещё не было")
     )
-    failing = [source for source in report.sources if source.consecutive_failures]
+    failing = [
+        source for source in report.sources if source.consecutive_failures or source.blocked_gaps
+    ]
     if not report.sources:
         lines.append("Источники ещё не опрашивались")
     elif failing:
         lines.append(f"Источники: ошибки в {len(failing)} из {len(report.sources)}")
         lines += [
-            f"• {esc(source.source_key)}: {esc(source.last_error)}"
-            f" (подряд: {source.consecutive_failures})"
+            f"• {esc(source.source_key)}: "
+            + (
+                f"{esc(source.last_error)} (подряд: {source.consecutive_failures})"
+                if source.consecutive_failures
+                else "работает"
+            )
+            + (
+                f"; заблокировано минут: {source.blocked_gaps} (qmemo-radar gaps)"
+                if source.blocked_gaps
+                else ""
+            )
             for source in failing
         ]
     else:

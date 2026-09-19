@@ -1,19 +1,40 @@
 import json
 import logging
+import random
 from collections import Counter, defaultdict
-from collections.abc import Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from uuid import uuid4
 
 from qmemo_radar.application.filtering import (
+    ITEM_REASONS,
     MANUAL_SOURCE_KEY,
     FilterPolicy,
     first_filter_reason,
 )
 from qmemo_radar.application.normalization import build_candidate
-from qmemo_radar.application.ports import EventRepository, Ranker, SourceCollector
+from qmemo_radar.application.ports import (
+    ClusterJoin,
+    ClusterScore,
+    EventRepository,
+    Mention,
+    Ranker,
+    RejectedSample,
+    SourceCollector,
+)
 from qmemo_radar.application.scoring import calculate_total
+from qmemo_radar.application.selection import (
+    SelectionPolicy,
+    TextFeatures,
+    article_of,
+    band_keys,
+    compare,
+    domain_of,
+    features,
+    gate_reason,
+    preselect,
+)
 from qmemo_radar.domain import (
     SHARED_URL_SOURCES,
     EventCandidate,
@@ -30,6 +51,18 @@ logger = logging.getLogger(__name__)
 DUPLICATE_CONTENT = "duplicate_content"
 # One SQLite transaction per chunk: few commits, and the write lock is never held for long.
 INGEST_CHUNK_SIZE = 500
+# Clustering works through new texts in batches; the cap bounds one run after a backlog (the
+# rest waits for the next run, or expires).
+CLUSTER_BATCH_SIZE = 1_000
+MAX_CLUSTERED_PER_RUN = 60_000
+SCORE_BATCH_SIZE = 1_000
+# Rejected texts kept per reason and run for `qmemo-radar rejected`; the rest is only counted.
+REJECTED_SAMPLES_PER_RUN = 20
+RANK_CANDIDATES_PER_RUN = 100
+# Stories indexed under one band key. Template-like texts (same words, different numbers) share
+# keys; past this a key is not extended, so candidates per new text stay bounded (8 x 50).
+MAX_STORIES_PER_KEY = 50
+SELECTION_KEY = "selection"
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,16 +83,22 @@ class RadarPipeline:
         repository: EventRepository,
         filter_policy: FilterPolicy,
         thresholds: PipelineThresholds,
+        selection: SelectionPolicy | None = None,
+        clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         self._collector = collector
         self._ranker = ranker
         self._repository = repository
         self._filter_policy = filter_policy
         self._thresholds = thresholds
+        self._selection = selection or SelectionPolicy()
+        self._clock = clock
 
     async def run_once(self, *, run_id: str | None = None) -> PipelineCounters:
         run_id = run_id or uuid4().hex
+        now = self._clock()
         metrics: defaultdict[str, Counter[str]] = defaultdict(Counter)
+        run = _RunState(now=now)
         checkpoints = await self._repository.get_checkpoints()
         for fetch in await self._collector.collect(checkpoints):
             log = {"run_id": run_id, "operation": "collect", "source_key": fetch.source_key}
@@ -67,8 +106,9 @@ class RadarPipeline:
             stats.update(fetch.stats)
             if fetch.error_code:
                 stats[Metric.SOURCE_ERRORS] += 1
+                # A cursor on a failed fetch is state that must survive it (e.g. failed attempts).
                 await self._repository.record_source_result(
-                    fetch.source_key, cursor=None, error_code=fetch.error_code
+                    fetch.source_key, cursor=fetch.cursor, error_code=fetch.error_code
                 )
                 logger.warning(
                     "source failed",
@@ -78,22 +118,24 @@ class RadarPipeline:
 
             stats[Metric.COLLECTED] += len(fetch.items)
             for chunk in _batches(fetch.items, size=INGEST_CHUNK_SIZE):
-                await self._ingest(chunk, stats)
+                await self._ingest(chunk, stats, run, fetch.source_key)
             # A storage error above aborts the run: the cursor moves only after every item is saved.
             await self._repository.record_source_result(
                 fetch.source_key, cursor=fetch.cursor, error_code=None
             )
             logger.info("source collected", extra={**log, "result": _describe(stats)})
 
-        pending = await self._repository.list_events_by_status(
-            EventStatus.DISCOVERED,
-            limit=100,
+        await self._repository.add_rejected_samples(
+            [sample for _, kept in run.samples.values() for sample in kept]
         )
+        await self._cluster(metrics, run)
+        pending = await self._repository.rank_candidates(limit=RANK_CANDIDATES_PER_RUN)
         candidates: list[EventCandidate] = []
         for event in pending:
-            # New items were screened on ingest; this re-check covers manual links, items left
-            # from older versions and candidates that became too old while waiting.
-            reason = first_filter_reason(event, self._filter_policy)
+            # New items were screened on ingest; this re-check covers manual links and rules
+            # changed since. Age is not re-checked: a story still growing is not too old, and
+            # the event TTL ends it.
+            reason = first_filter_reason(event, self._filter_policy, now=now, check_age=False)
             if reason is None and await self._repository.has_earlier_content_duplicate(event):
                 reason = DUPLICATE_CONTENT
             if reason:
@@ -122,7 +164,10 @@ class RadarPipeline:
             counters.collected += stats[Metric.COLLECTED]
             counters.inserted += stats[Metric.INSERTED]
             counters.duplicates += stats[Metric.EXACT_DUPLICATES]
-            counters.filtered += stats[Metric.FILTERED]
+            # Rejected by the gate (never stored) or by the filter (stored as FILTERED_OUT).
+            counters.filtered += stats[Metric.FILTERED] + sum(
+                value for name, value in stats.items() if name.startswith("rejected_")
+            )
             counters.source_errors += stats[Metric.SOURCE_ERRORS]
 
         if self._ranker is None:
@@ -199,17 +244,31 @@ class RadarPipeline:
                 counters.archived += 1
         return True
 
-    async def _ingest(self, items: Sequence[RawSourceItem], stats: Counter[str]) -> None:
-        """Stage 1 for one chunk: normalize, screen, drop exact duplicates, insert in one commit.
+    async def _ingest(
+        self,
+        items: Sequence[RawSourceItem],
+        stats: Counter[str],
+        run: "_RunState",
+        fetch_key: str,
+    ) -> None:
+        """Stage 1 for one chunk: gate, normalize, drop exact duplicates, insert in one commit.
 
-        Future stages (near dedup, clustering, preselection) read DISCOVERED events after this
-        and before ranking; they must not be added here.
+        The gate runs before anything is built, so obvious noise costs a counter and at most a
+        small sample. An exact copy of a stored text becomes a mention of it, not a second row.
         """
-        now = datetime.now(UTC)
+        now = run.now
+        kept: list[RawSourceItem] = []
         events: list[EventCandidate] = []
         for item in items:
+            if item.source_key != MANUAL_SOURCE_KEY:
+                rejected = gate_reason(item, self._selection, now=now)
+                if rejected:
+                    stats[f"rejected_{rejected}"] += 1
+                    run.sample(rejected, item)
+                    continue
             try:
                 events.append(_storable(build_candidate(item, discovered_at=now)))
+                kept.append(item)
             except ValueError:
                 # One bad upstream item must not abort the run: the cursor would never move and
                 # every run would fail on it again.
@@ -218,7 +277,8 @@ class RadarPipeline:
         ids, urls = set(known.ids), set(known.urls)
         owners = dict(known.content_owners)
         rows: list[EventCandidate] = []
-        for event in events:
+        mentions: list[Mention] = []
+        for item, event in zip(kept, events, strict=True):
             id_key = (event.source.value, event.external_id)
             url_key = (event.source.value, str(event.url))
             shared_url = event.source in SHARED_URL_SOURCES
@@ -228,32 +288,179 @@ class RadarPipeline:
             ids.add(id_key)
             if not shared_url:
                 urls.add(url_key)
+            url = str(event.url)
+            source_key = event.source_key or fetch_key
             reason = first_filter_reason(event, self._filter_policy, now=now)
             original = None if reason else owners.get(event.content_hash)
             if original:
-                reason = DUPLICATE_CONTENT
-            else:
+                stats[Metric.EXACT_DUPLICATES] += 1
+                if (original, url) not in known.mentions:
+                    # Provenance as one light row; the payload of the copy is not stored again.
+                    mentions.append(
+                        Mention(original, url, domain_of(url), article_of(item), source_key, now)
+                    )
+                    run.grown.add(original)
+                    stats[Metric.MENTIONS_AGGREGATED] += 1
+                continue
+            if reason not in ITEM_REASONS:
+                # A text rejected only for this item (too old, blocked author) must not own the
+                # text: a later clean copy would become its mention and never be ranked.
                 owners.setdefault(event.content_hash, event.event_id)
             if reason:
-                # Kept, not dropped: retention prunes noise later and copies count as signal.
+                # Kept, not dropped: retention prunes noise later.
                 event = event.model_copy(
-                    update={
-                        "status": EventStatus.FILTERED_OUT,
-                        "filter_reason": reason,
-                        "duplicate_of_event_id": original,
-                    }
+                    update={"status": EventStatus.FILTERED_OUT, "filter_reason": reason}
                 )
                 stats[_metric_for(reason)] += 1
             rows.append(event)
-        inserted = await self._repository.add_events(rows)
+        inserted = await self._repository.add_events(rows, mentions)
         stats[Metric.INSERTED] += inserted
         # Only a concurrent writer (a manual link) can make this non-zero.
         stats[Metric.EXACT_DUPLICATES] += len(rows) - inserted
+
+    async def _cluster(self, metrics: defaultdict[str, Counter[str]], run: "_RunState") -> None:
+        """Stage 2: new texts join a story (near duplicate or same event) or start one; every
+        story that changed gets a fresh preselection score."""
+        policy, now = self._selection, run.now
+        touched = await self._repository.clusters_of(sorted(run.grown))
+        cache: dict[str, TextFeatures] = {}
+        for _ in range(MAX_CLUSTERED_PER_RUN // CLUSTER_BATCH_SIZE):
+            batch = await self._repository.unclustered_events(limit=CLUSTER_BATCH_SIZE)
+            if not batch:
+                break
+            found = {event.event_id: features(event.original_text) for event in batch}
+            keys = {event_id: band_keys(feats.tokens) for event_id, feats in found.items()}
+            stored = await self._repository.representatives(
+                [key for values in keys.values() for key in values],
+                seen_since=now - policy.window,
+            )
+            texts = {rep.event_id: rep.text for reps in stored.values() for rep in reps}
+            local: defaultdict[int, list[tuple[str, str | None]]] = defaultdict(list)
+            new_clusters: list[tuple[EventCandidate, tuple[int, ...]]] = []
+            joins: list[ClusterJoin] = []
+            for event in batch:
+                source = event.source_key or event.source.value
+                event_keys = keys[event.event_id]
+                options = {
+                    (rep.event_id, rep.language)
+                    for key in event_keys
+                    for rep in stored.get(key, [])
+                } | {option for key in event_keys for option in local.get(key, [])}
+                best: tuple[bool, float, str, str] | None = None
+                for rep_id, rep_language in options:
+                    if (rep_language or "").casefold() != (event.language or "").casefold():
+                        continue
+                    rep_features = cache.get(rep_id) or found.get(rep_id)
+                    if rep_features is None:
+                        rep_features = cache[rep_id] = features(texts[rep_id])
+                    kind, similarity = compare(rep_features, found[event.event_id], policy)
+                    if kind is None:
+                        continue
+                    option = (kind == "near_duplicate", similarity, rep_id, kind)
+                    if best is None or option[:2] > best[:2]:
+                        best = option
+                if best is None:
+                    indexed = tuple(
+                        key
+                        for key in event_keys
+                        if len(stored.get(key, ())) + len(local[key]) < MAX_STORIES_PER_KEY
+                    )
+                    new_clusters.append((event, indexed))
+                    for key in indexed:
+                        local[key].append((event.event_id, event.language))
+                    metrics[source][Metric.CLUSTERS_CREATED] += 1
+                    if len(indexed) < len(event_keys):
+                        metrics[source]["band_keys_full"] += 1
+                else:
+                    joins.append(ClusterJoin(event.event_id, best[2], best[3]))
+                    name = Metric.NEAR_DUPLICATES if best[0] else "same_event"
+                    metrics[source][name] += 1
+            await self._repository.save_clustering(new_clusters, joins, now=now)
+            touched |= await self._repository.clusters_of([event.event_id for event in batch])
+
+        # Stories grown or created since their last score, including by a run that failed.
+        touched |= await self._repository.unscored_clusters(limit=MAX_CLUSTERED_PER_RUN)
+        # In batches: every refreshed story is held with its representative in memory.
+        ordered = sorted(touched)
+        for start in range(0, len(ordered), SCORE_BATCH_SIZE):
+            await self._score(ordered[start : start + SCORE_BATCH_SIZE], metrics, now)
+
+    async def _score(
+        self, cluster_ids: list[int], metrics: defaultdict[str, Counter[str]], now: datetime
+    ) -> None:
+        """Refresh, score and save one batch of stories."""
+        policy = self._selection
+        scores: list[ClusterScore] = []
+        reopen: list[str] = []
+        refreshed = await self._repository.refresh_clusters(cluster_ids, now=now)
+        results = {signals.cluster_id: preselect(signals, policy, now=now) for signals in refreshed}
+        # One quote per article: an article with ten quotes is one story for the reader. The
+        # quote preselected first keeps the place; within a run the best one takes it.
+        articles = {signals.cluster_id: article_of(signals.event) for signals in refreshed}
+        holders = await self._repository.preselected_articles(sorted(set(articles.values())))
+        for signals in sorted(refreshed, key=lambda s: -results[s.cluster_id].total):
+            cluster_id = signals.cluster_id
+            assert cluster_id is not None
+            result = results[cluster_id]
+            source = signals.event.source_key or signals.event.source.value
+            always = signals.event.source.value in policy.always_rank_sources
+            # Once preselected (or a sibling), always: a story that cools down was ranked
+            # already, and its article keeps one holder.
+            passes = always or result.total >= policy.min_preselect_score
+            passes = passes or signals.state in ("preselected", "sibling")
+            holder = holders.setdefault(articles[cluster_id], cluster_id) if passes else None
+            if result.boilerplate:
+                state = "boilerplate"
+            elif signals.state == "sibling" or (passes and holder != cluster_id and not always):
+                state = "sibling"
+                metrics[source]["article_siblings"] += 1
+            elif passes:
+                state = "preselected"
+                metrics[source][Metric.PRESELECTED] += 1
+                grown = result.total >= self._thresholds.digest
+                if signals.event.status is EventStatus.ARCHIVED and grown:
+                    reopen.append(signals.event.event_id)
+            else:
+                state = "candidate"
+            # Explained only where someone will look: below preselection the score is enough.
+            details: dict[str, object] = {}
+            if state != "candidate":
+                details = {
+                    "breakdown": result.breakdown.model_dump(),
+                    "notes": list(result.notes),
+                    "topics": list(result.topics),
+                }
+            scores.append(ClusterScore(cluster_id, state, result.total, details))
+        await self._repository.save_preselection(scores)
+        if reopen:
+            # The story grew after it was ranked below the digest: rank it again.
+            metrics[SELECTION_KEY]["reopened"] += await self._repository.reopen_archived(reopen)
 
     def _status_for_score(self, total: int) -> EventStatus:
         if total >= self._thresholds.digest:
             return EventStatus.SHORTLISTED
         return EventStatus.ARCHIVED
+
+
+@dataclass
+class _RunState:
+    """What one run collects on the way: its clock, stories that grew, rejected samples."""
+
+    now: datetime
+    grown: set[str] = field(default_factory=set)
+    samples: dict[str, tuple[int, list[RejectedSample]]] = field(default_factory=dict)
+
+    def sample(self, reason: str, item: RawSourceItem) -> None:
+        """Reservoir sample: every rejected item of a run has the same chance to be kept."""
+        seen, kept = self.samples.get(reason, (0, []))
+        sample = RejectedSample(
+            reason, item.source_key, item.original_text, str(item.url), self.now
+        )
+        if len(kept) < REJECTED_SAMPLES_PER_RUN:
+            kept.append(sample)
+        elif (slot := random.randrange(seen + 1)) < REJECTED_SAMPLES_PER_RUN:
+            kept[slot] = sample
+        self.samples[reason] = (seen + 1, kept)
 
 
 def _storable(event: EventCandidate) -> EventCandidate:
