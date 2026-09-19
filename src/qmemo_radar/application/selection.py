@@ -378,11 +378,15 @@ BANDS = 8
 ROWS = 4
 
 
-@lru_cache(maxsize=200_000)
 def _token_hashes(token: str) -> tuple[int, ...]:
+    return struct.unpack("<32I", _token_digest(token))[: BANDS * ROWS]
+
+
+# 128 bytes per token instead of 32 Python ints (measured 273 MB at 200k tokens): ~20 MB here.
+@lru_cache(maxsize=100_000)
+def _token_digest(token: str) -> bytes:
     data = hashlib.blake2b(token.encode(), digest_size=64).digest()
-    data += hashlib.blake2b(token.encode(), digest_size=64, person=b"minhash").digest()
-    return struct.unpack("<32I", data)[: BANDS * ROWS]
+    return data + hashlib.blake2b(token.encode(), digest_size=64, person=b"minhash").digest()
 
 
 def band_keys(tokens: frozenset[str]) -> tuple[int, ...]:

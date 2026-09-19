@@ -55,6 +55,7 @@ INGEST_CHUNK_SIZE = 500
 # rest waits for the next run, or expires).
 CLUSTER_BATCH_SIZE = 1_000
 MAX_CLUSTERED_PER_RUN = 60_000
+SCORE_BATCH_SIZE = 1_000
 # Rejected texts kept per reason and run for `qmemo-radar rejected`; the rest is only counted.
 REJECTED_SAMPLES_PER_RUN = 20
 RANK_CANDIDATES_PER_RUN = 100
@@ -379,9 +380,19 @@ class RadarPipeline:
 
         # Stories grown or created since their last score, including by a run that failed.
         touched |= await self._repository.unscored_clusters(limit=MAX_CLUSTERED_PER_RUN)
+        # In batches: every refreshed story is held with its representative in memory.
+        ordered = sorted(touched)
+        for start in range(0, len(ordered), SCORE_BATCH_SIZE):
+            await self._score(ordered[start : start + SCORE_BATCH_SIZE], metrics, now)
+
+    async def _score(
+        self, cluster_ids: list[int], metrics: defaultdict[str, Counter[str]], now: datetime
+    ) -> None:
+        """Refresh, score and save one batch of stories."""
+        policy = self._selection
         scores: list[ClusterScore] = []
         reopen: list[str] = []
-        refreshed = await self._repository.refresh_clusters(sorted(touched), now=now)
+        refreshed = await self._repository.refresh_clusters(cluster_ids, now=now)
         results = {signals.cluster_id: preselect(signals, policy, now=now) for signals in refreshed}
         # One quote per article: an article with ten quotes is one story for the reader. The
         # quote preselected first keeps the place; within a run the best one takes it.

@@ -485,3 +485,37 @@ async def test_a_copy_filtered_for_its_age_does_not_own_the_fresh_copies(
         ("s0.example-10", "SHORTLISTED", None),
     ]
     assert query(repository, "SELECT mention_count FROM event_clusters") == [(30,)]
+
+
+async def test_stories_are_refreshed_in_bounded_batches(
+    repository: SQLiteEventRepository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Independent review: every touched story was loaded at once (131 MB for 20k stories).
+    from qmemo_radar.application import pipeline as module
+
+    monkeypatch.setattr(module, "SCORE_BATCH_SIZE", 40)
+    sizes: list[int] = []
+    original = repository.refresh_clusters
+
+    async def spy(cluster_ids: list[int], *, now: datetime) -> object:
+        sizes.append(len(cluster_ids))
+        return await original(cluster_ids, now=now)
+
+    monkeypatch.setattr(repository, "refresh_clusters", spy)
+    items = [
+        quote(f"Statement number {n} about a completely separate local matter here", "s.example", n)
+        for n in range(100)
+    ]
+    await radar(repository, Batches(items)).run_once()
+
+    assert sizes == [40, 40, 20]
+    assert query(repository, "SELECT COUNT(*) FROM event_clusters WHERE preselect_score = -1") == [
+        (0,)
+    ]
+
+
+def test_the_token_hash_cache_holds_bytes_and_is_bounded() -> None:
+    from qmemo_radar.application.selection import _token_digest
+
+    assert isinstance(_token_digest("bitcoin"), bytes) and len(_token_digest("bitcoin")) == 128
+    assert _token_digest.cache_info().maxsize == 100_000
