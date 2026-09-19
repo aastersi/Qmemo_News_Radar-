@@ -22,6 +22,9 @@ Radar изолирован от Brain, Dulty и сайта Quote Memorial: св�
 | Multi-source основа | реестр источников, пакетная загрузка, метрики по источникам, отчёт retention |
 | Бесплатные источники | GDELT Global Quotation Graph (цитата = объект, курсор по минутам, пропуски 404) и RSS/Atom (ETag/Last-Modified, защита от частных адресов), команда `sample` |
 | Бюджет | `BudgetGuard` и `cost_ledger`: платный вызов блокируется до запроса при выключенном флаге, неизвестной цене или месячном пределе |
+| Отбор (M4) | фильтр до записи, точные копии как упоминания, near dedup и истории (MinHash-LSH), объяснимая преселекция по числу независимых статей, одна цитата на статью |
+| Бесплатное ранжирование | без платного LLM истории оцениваются кодом и попадают в Telegram за $0; LLM — необязательное улучшение |
+| Аудит и хранение | `funnel`, `clusters`, `cluster <id>`, `rejected`, `gaps`; `prune` — только отчёт, удаление с `--apply` |
 
 Путь `X → фильтр → ранжирование → SQLite → Telegram → черновик → одобрение → outbox` проверен сквозными тестами с поддельными X, LLM и Telegram и офлайн-командой `dry-run`. С настоящими ключами X, LLM и Telegram сервис в этом репозитории не запускался — это первый шаг пилота.
 
@@ -151,6 +154,16 @@ rss:
 
 Каждая лента — источник `rss:<name>` со своим checkpoint; ответ `304` — успешный сбор без новых записей. Каждый аккаунт и каждый запрос X — отдельный источник со своим checkpoint (`account:<handle>`, `query:<name>`). Первый сбор читает последние 60 минут, дальше только новые публикации через `since_id`. Ошибка одного источника не останавливает остальные и видна в `/status`.
 
+Отбор (`selection`) тоже задаётся в `sources.yaml`: пороги фильтра до записи, заблокированные домены и слова, темы, пороги склейки историй и преселекции. Пример со всеми полями и значениями по умолчанию — в `sources.example.yaml`. Без секции работают значения по умолчанию.
+
+```yaml
+selection:
+  gate: {min_words: 5, blocked_domains: [spam.example]}
+  topics:
+    - {name: ai, terms: [artificial intelligence, openai], weight: 5}
+  preselection: {min_score: 55}
+```
+
 После изменения файла: `docker compose restart radar`.
 
 ## Telegram
@@ -182,6 +195,12 @@ rss:
 | `qmemo-radar healthcheck` | код 0, если планировщик отмечался последние 3 минуты |
 | `qmemo-radar init-db` | создать базу и применить миграции |
 | `qmemo-radar sample --source gdelt\|rss\|rss:<name> [--limit 20] [--random]` | последние (или случайные) сохранённые объекты источника в JSON; только чтение, без сети |
+| `qmemo-radar funnel [--hours 24]` | воронка: получено → отброшено по причинам → копии → истории → преселекция → Telegram; только чтение |
+| `qmemo-radar clusters [--state preselected] [--order score\|mentions\|recent] [--limit 20]` | истории с числом статей, сайтов и оценкой |
+| `qmemo-radar cluster <id>` | одна история: варианты текста, где встречалась, почему прошла или нет |
+| `qmemo-radar rejected [--reason too_few_words] [--limit 20]` | случайные примеры отброшенного фильтром до записи |
+| `qmemo-radar gaps [--skip <минута>\|all]` | заблокированные минуты GDELT; `--skip` отказывается от них с записью |
+| `qmemo-radar prune [--apply]` | что можно удалить по retention; без `--apply` ничего не удаляет |
 
 ```bash
 docker compose ps                                  # статус и health контейнера
