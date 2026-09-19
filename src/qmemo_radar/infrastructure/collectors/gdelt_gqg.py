@@ -51,6 +51,7 @@ _CONTEXT_CHARS = 500
 # visible stop (gdelt_blocked_gaps_full) instead of an ever-growing list.
 MAX_BLOCKED_MINUTES = 30
 MAX_SKIPPED_RECORDS = 200
+_OUTAGE = frozenset({"gdelt_network_error", "gdelt_server_error", "gdelt_rate_limited"})
 
 
 class GdeltQuotationCollector:
@@ -121,13 +122,16 @@ class GdeltQuotationCollector:
     async def _retry_blocked(
         self, state: "GdeltCursor", fetches: list[SourceFetch], stats: Counter[str]
     ) -> None:
-        """One attempt per blocked minute and run; the first failure ends it (likely an outage)."""
+        """One attempt per blocked minute and run. An outage (network, 5xx, 429) ends the retries
+        for this run; a minute failing on its own (403, other 4xx) does not hold up the rest."""
         for name in sorted(state.blocked):
             minute = _parse_minute(name)
             outcome = await self._check(minute, stats, attempts=1) if minute else None
             if isinstance(outcome, str):
                 state.blocked[name]["attempts"] = int(state.blocked[name].get("attempts", 0)) + 1
-                return
+                if outcome in _OUTAGE:
+                    return
+                continue
             del state.blocked[name]
             stats["gaps_recovered"] += 1
             # Saved with its items: the minute leaves the list only once they are stored.

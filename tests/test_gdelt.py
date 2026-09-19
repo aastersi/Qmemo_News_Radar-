@@ -54,8 +54,8 @@ def gz(*rows: object) -> bytes:
     return gzip.compress(b"\n".join(lines) + b"\n")
 
 
-FIRST = 'We will not raise taxes this year, whatever happens in parliament'
-SECOND = 'The budget is balanced for the first time in a decade and it stays so'
+FIRST = "We will not raise taxes this year, whatever happens in parliament"
+SECOND = "The budget is balanced for the first time in a decade and it stays so"
 SPANISH = "Una frase bastante larga para el radar"
 FRENCH = "Une phrase assez longue pour le radar"
 
@@ -618,3 +618,46 @@ class _Any:
 
 
 ANY_ENTRY = _Any()
+
+
+async def test_one_permanently_blocked_minute_does_not_hold_up_the_others(
+    repository: SQLiteEventRepository,
+) -> None:
+    # Independent review: retries stopped at the first failure, so a minute failing forever
+    # kept every later blocked minute from ever being retried.
+    blocked = {
+        minute("12:00"): {"reason": "gdelt_http_403", "attempts": 3, "since": "x"},
+        minute("12:01"): {"reason": "gdelt_server_error", "attempts": 3, "since": "x"},
+    }
+    await repository.record_source_result(
+        SOURCE_KEY,
+        cursor=GdeltCursor(next=datetime(2026, 9, 16, 12, 21, tzinfo=UTC), blocked=blocked).dump(),
+        error_code=None,
+    )
+    gdelt = Gdelt(
+        {minute("12:00"): 403, minute("12:01"): gz(article("https://news.example/late", FIRST))}
+    )
+
+    counters = await pipeline(gdelt.collector(), repository).run_once()
+
+    assert counters.inserted == 1
+    assert list((await cursor_of(repository))[2]) == [minute("12:00")]
+
+
+async def test_an_outage_ends_the_retries_of_blocked_minutes_for_the_run(
+    repository: SQLiteEventRepository,
+) -> None:
+    blocked = {
+        minute(f"12:0{n}"): {"reason": "gdelt_server_error", "attempts": 3, "since": "x"}
+        for n in range(3)
+    }
+    await repository.record_source_result(
+        SOURCE_KEY,
+        cursor=GdeltCursor(next=datetime(2026, 9, 16, 12, 21, tzinfo=UTC), blocked=blocked).dump(),
+        error_code=None,
+    )
+    gdelt = Gdelt({minute(f"12:0{n}"): 503 for n in range(3)})
+
+    await pipeline(gdelt.collector(), repository).run_once()
+
+    assert [gdelt.requested.count(minute(f"12:0{n}")) for n in range(3)] == [1, 0, 0]
