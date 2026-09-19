@@ -46,7 +46,7 @@ class SelectionPolicy:
     topics: tuple[Topic, ...] = ()
     window: timedelta = timedelta(hours=48)
     near_duplicate_jaccard: float = 0.8
-    same_event_overlap: float = 0.9
+    same_event_overlap: float = 1.0
     same_event_min_shared: int = 4
     min_preselect_score: int = 55
     always_rank_sources: frozenset[str] = frozenset({"x"})
@@ -165,6 +165,9 @@ _NEGATIONS = frozenset(
     "not no never nobody nothing none neither nor cannot can't won't don't doesn't didn't isn't "
     "aren't wasn't weren't shouldn't wouldn't couldn't haven't hasn't hadn't ain't".split()
 )
+_POLARITY = frozenset(
+    "up down above below before after more less over under against without off out".split()
+)
 # English function words and reporting verbs: they carry no story, only phrasing.
 STOPWORDS = frozenset(
     """a about above after again against all am an and any are as at be because been before being
@@ -204,6 +207,11 @@ class TextFeatures:
     numbers: frozenset[str]
     negated: bool
     entities: frozenset[str]
+    # Direction words (up/down, before/after, against...): function words for similarity, but
+    # the same sentence with another one says something else.
+    polarity: frozenset[str] = frozenset()
+    # Proper nouns in order: "Russia attacked Ukraine" is not "Ukraine attacked Russia".
+    entity_order: tuple[str, ...] = ()
 
 
 def features(text: str) -> TextFeatures:
@@ -215,11 +223,14 @@ def features(text: str) -> TextFeatures:
         for word in words
         if word not in STOPWORDS and word not in _NEGATIONS
     )
+    order = _entity_order(text)
     return TextFeatures(
         tokens=tokens | {f"#{number}" for number in numbers},
         numbers=numbers,
         negated=any(word in _NEGATIONS or word.endswith("n't") for word in words),
-        entities=_entities(text),
+        entities=frozenset(order),
+        polarity=frozenset(word for word in words if word in _POLARITY),
+        entity_order=tuple(dict.fromkeys(order)),
     )
 
 
@@ -234,10 +245,10 @@ def _number_value(match: re.Match[str]) -> str:
 _CAPITALIZED = re.compile(r"(?<![.!?]\s)(?<!^)\b[A-Z][\w'’-]+")
 
 
-def _entities(text: str) -> frozenset[str]:
+def _entity_order(text: str) -> list[str]:
     """Capitalized words not starting a sentence: a crude but predictable proper-noun guess."""
     stripped = text.strip().lstrip("\"'“‘(")
-    return frozenset(
+    return list(
         word.casefold().removesuffix("'s").removesuffix("’s")
         for word in _CAPITALIZED.findall(stripped)
         if word not in ("I", "I'm", "I've", "I'll", "I'd")
@@ -254,21 +265,27 @@ def compare(
     side only or a proper noun the other text lacks mean different statements."""
     if len(a.tokens) < 3 or len(b.tokens) < 3:
         return None, 0.0
-    if a.numbers != b.numbers or a.negated != b.negated:
+    if a.numbers != b.numbers or a.negated != b.negated or a.polarity != b.polarity:
         return None, 0.0
     small, large = sorted((a.entities, b.entities), key=len)
     if not small <= large:
         return None, 0.0
+    if a.entities == b.entities and len(a.entities) > 1 and a.entity_order != b.entity_order:
+        return None, 0.0
     if _opposed(a.tokens - b.tokens, b.tokens - a.tokens):
         return None, 0.0
     shared = len(a.tokens & b.tokens)
+    overlap = shared / min(len(a.tokens), len(b.tokens))
+    # A word swapped on both sides (approve/block, five/ten, rising/slowing) can flip the
+    # statement, and nothing here tells a synonym from an opposite: by default (1.0) one text
+    # must lie wholly inside the other, after the synonym map.
+    if overlap < policy.same_event_overlap:
+        return None, 0.0
     jaccard = shared / len(a.tokens | b.tokens)
     if jaccard >= policy.near_duplicate_jaccard:
         return "near_duplicate", jaccard
-    overlap = shared / min(len(a.tokens), len(b.tokens))
-    # A short text wholly inside a longer one (another outlet quoted less) needs fewer words.
-    enough = shared >= policy.same_event_min_shared or (overlap == 1.0 and shared >= 3)
-    if overlap >= policy.same_event_overlap and enough:
+    # A short text inside a longer one (another outlet quoted less) needs fewer shared words.
+    if shared >= policy.same_event_min_shared or (overlap == 1.0 and shared >= 3):
         return "same_event", overlap
     return None, 0.0
 

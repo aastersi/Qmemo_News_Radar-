@@ -78,7 +78,7 @@ selection:
   clustering:
     window_hours: 48
     near_duplicate_jaccard: 0.8   # почти дубликат: доля общих значимых слов
-    same_event_overlap: 0.9       # то же событие: доля слов короткого текста в длинном
+    same_event_overlap: 1.0       # доля слов короткого текста в длинном (1.0 — целиком внутри)
     same_event_min_shared: 4
 
   preselection:

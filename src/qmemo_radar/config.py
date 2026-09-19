@@ -256,9 +256,10 @@ class ClusteringRules(_SourcesModel):
     window_hours: int = Field(default=48, ge=1, le=720)
     # Near duplicate: Jaccard similarity of the content words.
     near_duplicate_jaccard: float = Field(default=0.8, ge=0.5, le=1)
-    # Same event: share of the shorter text's content words found in the other one (0.9: a
-    # short text must be wholly inside the other; one different word only in long texts) ...
-    same_event_overlap: float = Field(default=0.9, ge=0.5, le=1)
+    # Share of the shorter text's content words found in the other one, for both kinds. 1.0:
+    # one text lies wholly inside the other (after the synonym map); lower allows swapped
+    # words, which also lets approve/block or five/ten through ...
+    same_event_overlap: float = Field(default=1.0, ge=0.5, le=1)
     # ... and at least this many shared content words.
     same_event_min_shared: int = Field(default=4, ge=2, le=20)
 

@@ -143,6 +143,44 @@ SAME_STORY = [
 ]
 
 DIFFERENT_STORIES = [
+    # Found by the independent M4 review: opposite words that were stopwords, swapped words not
+    # in any list, number words and swapped roles all merged.
+    (
+        "prices went up sharply this week across all major markets in the region",
+        "prices went down sharply this week across all major markets in the region",
+    ),
+    (
+        "the senate voted to approve the climate bill after a long debate on the floor today",
+        "the senate voted to block the climate bill after a long debate on the floor today",
+    ),
+    (
+        "the central bank will increase interest rates sharply next month to fight inflation",
+        "the central bank will reduce interest rates sharply next month to fight inflation",
+    ),
+    (
+        "our company plans to cut five thousand jobs across europe over the coming months",
+        "our company plans to cut ten thousand jobs across europe over the coming months",
+    ),
+    (
+        "inflation is rising faster than expected across the whole euro area this quarter",
+        "inflation is slowing faster than expected across the whole euro area this quarter",
+    ),
+    (
+        "we believe the ceasefire agreement will hold and the fighting has ended for good",
+        "we doubt the ceasefire agreement will hold and the fighting has ended for good",
+    ),
+    (
+        "Apple agreed to buy Google for a record sum, the company said on Monday",
+        "Google agreed to buy Apple for a record sum, the company said on Monday",
+    ),
+    (
+        "the tax cut must pass before the election, the speaker told reporters",
+        "the tax cut must pass after the election, the speaker told reporters",
+    ),
+    (
+        "the governor will vote for the new stadium plan at the council meeting",
+        "the governor will vote against the new stadium plan at the council meeting",
+    ),
     ("CEO says Bitcoin will reach $200k this year", "CEO says Bitcoin will reach $100k this year"),
     ("CEO says Bitcoin will reach $200k this year", "CEO says Ethereum will reach $200k this year"),
     (
