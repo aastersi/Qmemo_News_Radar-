@@ -328,3 +328,42 @@ async def test_entity_declarations_are_refused_in_any_encoding() -> None:
     by_key = {fetch.source_key: fetch for fetch in fetches}
     assert by_key["rss:bomb"].error_code == "rss_malformed_xml"
     assert len(by_key["rss:long"].items[0].original_text) == 500
+
+
+async def test_a_compressed_response_is_capped_while_it_is_decoded() -> None:
+    # Regression: httpx decoded a whole received chunk before the size check, so ~50 KB of gzip
+    # could expand to ~50 MB in memory before `rss_response_too_large`.
+    import gzip
+    import tracemalloc
+
+    def encoded(body: bytes, encoding: str) -> Callable[[httpx.Request], httpx.Response]:
+        # A raw stream, as from the network: httpx has not decoded it yet.
+        headers = {"Content-Encoding": encoding}
+        return lambda request: httpx.Response(200, stream=httpx.ByteStream(body), headers=headers)
+
+    bomb = gzip.compress(b"<rss>" + b" " * (50 * 1024 * 1024))
+    web = Web(
+        {
+            "https://bomb.example/rss": encoded(bomb, "gzip"),
+            "https://wire.example/rss": encoded(gzip.compress(RSS), "gzip"),
+            "https://br.example/rss": encoded(b"...", "br"),
+        }
+    )
+    collector = web.collector(
+        ("bomb", "https://bomb.example/rss"),
+        ("wire", "https://wire.example/rss"),
+        ("br", "https://br.example/rss"),
+        max_bytes=1_000_000,
+    )
+
+    tracemalloc.start()
+    fetches = await collector.collect({})
+    peak = tracemalloc.get_traced_memory()[1]
+    tracemalloc.stop()
+
+    by_key = {fetch.source_key: fetch for fetch in fetches}
+    assert by_key["rss:bomb"].error_code == "rss_response_too_large"
+    assert len(by_key["rss:wire"].items) == 2  # gzip-encoded feeds still work
+    assert by_key["rss:br"].error_code == "rss_unsupported_encoding"
+    assert peak < 8 * 1024 * 1024  # never near the 50 MB the bomb expands to
+    assert web.requests[0].headers["accept-encoding"] == "gzip, deflate"
