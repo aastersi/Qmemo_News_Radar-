@@ -2,6 +2,7 @@
 
 import json
 import logging
+import re
 import sys
 from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import AsyncExitStack, asynccontextmanager
@@ -15,6 +16,7 @@ from qmemo_radar.application.budget import BudgetGuard, PaidFeature
 from qmemo_radar.application.collection import MultiSourceCollector
 from qmemo_radar.application.drafting import DraftService
 from qmemo_radar.application.filtering import FilterPolicy
+from qmemo_radar.application.free_ranking import FreeRanker
 from qmemo_radar.application.normalization import comparison_text
 from qmemo_radar.application.pipeline import PipelineThresholds, RadarPipeline
 from qmemo_radar.application.ports import (
@@ -29,7 +31,8 @@ from qmemo_radar.application.ports import (
 from qmemo_radar.application.review import DeliveryLimits, ReviewService
 from qmemo_radar.application.runner import RadarRunner
 from qmemo_radar.application.scheduler import RadarScheduler
-from qmemo_radar.config import RadarSettings, SourcesConfig
+from qmemo_radar.application.selection import SelectionPolicy, topic
+from qmemo_radar.config import RadarSettings, SelectionConfig, SourcesConfig
 from qmemo_radar.exceptions import ProductionAdapterNotConfigured
 from qmemo_radar.infrastructure.collectors.gdelt_gqg import GdeltQuotationCollector
 from qmemo_radar.infrastructure.collectors.rss import Feed, RssCollector
@@ -117,6 +120,35 @@ def build_pipeline(
             digest=settings.digest_threshold,
             urgent=settings.urgent_threshold,
         ),
+        selection=selection_policy(resolved_sources.selection),
+    )
+
+
+def selection_policy(config: SelectionConfig) -> SelectionPolicy:
+    """sources.yaml `selection` as the rules the pipeline applies (patterns compiled once)."""
+    gate, clustering, preselection = config.gate, config.clustering, config.preselection
+    return SelectionPolicy(
+        min_words=gate.min_words,
+        min_chars=gate.min_chars,
+        max_chars=gate.max_chars,
+        languages=frozenset(language.strip().casefold() for language in gate.languages),
+        blocked_terms=tuple(comparison_text(term) for term in gate.blocked_terms),
+        blocked_domains=tuple(
+            domain.strip().lower().removeprefix("www.") for domain in gate.blocked_domains
+        ),
+        templates=tuple(re.compile(pattern) for pattern in gate.template_patterns),
+        min_letter_ratio=gate.min_letter_ratio,
+        max_url_age=timedelta(days=gate.max_url_age_days) if gate.max_url_age_days else None,
+        require_topic=gate.require_topic,
+        topics=tuple(topic(rule.name, rule.terms, rule.weight) for rule in config.topics),
+        window=timedelta(hours=clustering.window_hours),
+        near_duplicate_jaccard=clustering.near_duplicate_jaccard,
+        same_event_overlap=clustering.same_event_overlap,
+        same_event_min_shared=clustering.same_event_min_shared,
+        min_preselect_score=preselection.min_score,
+        always_rank_sources=frozenset(preselection.always_rank_sources),
+        boilerplate_min_mentions=preselection.boilerplate_min_mentions,
+        boilerplate_max_domains=preselection.boilerplate_max_domains,
     )
 
 
@@ -292,18 +324,20 @@ async def build_runtime(settings: RadarSettings, sources: SourcesConfig) -> Asyn
         collector = build_collector(SourceContext(settings, sources, x_client, free_http))
         # An upgrade from the X pilot without the new paid flags would otherwise run silently idle.
         logger.log(
-            logging.INFO if collector.names and llm else logging.WARNING,
+            logging.INFO if collector.names else logging.WARNING,
             "radar capabilities",
             extra={
                 "operation": "startup",
                 "result": f"sources={','.join(collector.names) or 'none'} "
-                f"ranking={'llm' if llm else 'off'} x_lookup={'on' if x_client else 'off'}",
+                f"ranking={'llm' if llm else 'free'} x_lookup={'on' if x_client else 'off'}",
             },
         )
+        # Without a paid LLM the free ranker scores preselected stories: $0 and no network.
+        free = FreeRanker(application.repository, selection_policy(sources.selection))
         services = build_services(
             application,
             collector=collector,
-            ranker=LlmRanker(llm) if llm else None,
+            ranker=LlmRanker(llm) if llm else free,
             writer=LlmDraftWriter(llm) if llm else DisabledDraftWriter(),
             gateway=TelegramReviewGateway(
                 bot, chat_id=settings.allowed_telegram_id, timezone=settings.zone

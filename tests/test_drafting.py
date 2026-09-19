@@ -223,7 +223,9 @@ async def test_reported_speech_uses_speaker_from_the_source_and_needs_review(
     assert good.draft is not None
     assert good.draft.quote_author == "Mara Quinn"
     assert good.draft.fact_check_status is FactCheckStatus.NEEDS_REVIEW
-    other_id = await notified_event(repository, source.replace("keynote", "summit"), number=2)
+    # Another speaker: the same words from Mara Quinn would be one story (a near duplicate).
+    other = 'Helios CTO Ada Park at the summit: "Every wallet will run on solar nodes."'
+    other_id = await notified_event(repository, other, number=2)
     bad = await DraftService(repository=repository, writer=ScriptedWriter(invented)).use(
         other_id, OWNER_ID
     )

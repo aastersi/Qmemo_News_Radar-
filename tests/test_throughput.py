@@ -1,7 +1,8 @@
 """Synthetic ingestion load: 200,000 items in every CI run, 1,000,000 on request.
 
-Only the ingestion path is measured (collect -> normalize -> screen -> dedup -> SQLite ->
-checkpoint -> metrics). Ranking is off, as in production without paid LLM.
+Measured: collect -> gate -> normalize -> dedup -> SQLite -> checkpoint -> metrics -> clustering
+-> preselection. Ranking is off. The synthetic texts differ only by numbers, the worst case for
+clustering (they all share band keys), so this also bounds that stage.
 """
 
 import json
@@ -84,7 +85,8 @@ async def ingest(total: int, db: Path) -> dict[str, float]:
 
     runs = total // RUN_SIZE
     assert totals.collected == total and totals.source_errors == 0
-    assert totals.inserted == total - runs * 100  # re-sent items are never stored twice
+    # Re-sent items are never stored twice; an identical-text copy is a mention, not a row;
+    assert totals.inserted == total - runs * 300  # and "Too short" is never stored
     assert totals.duplicates == runs * 200  # re-sent items and identical-text copies
     assert totals.filtered == runs * 100
     stored = await repository.count_by_status()
@@ -92,7 +94,8 @@ async def ingest(total: int, db: Path) -> dict[str, float]:
 
     sources.start = 0  # the first run again, e.g. after a lost checkpoint
     again = await pipeline.run_once()
-    assert again.inserted == 0 and again.duplicates == RUN_SIZE
+    # The re-sent run: every item is known again, except "Too short", rejected again by the gate.
+    assert again.inserted == 0 and again.duplicates == RUN_SIZE - 100
 
     metrics = await repository.metrics_since(datetime(2000, 1, 1, tzinfo=UTC))
     assert sum(values.get("collected", 0) for values in metrics.values()) == total + RUN_SIZE

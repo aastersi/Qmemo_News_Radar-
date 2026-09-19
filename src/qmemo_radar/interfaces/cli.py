@@ -4,15 +4,17 @@ import itertools
 import json
 import sys
 import time
+from collections import Counter
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from pydantic import HttpUrl
 
 from qmemo_radar.application.budget import month_start
+from qmemo_radar.application.ports import PruneCutoffs
 from qmemo_radar.application.runner import HEARTBEAT_KEY
 from qmemo_radar.bootstrap import build_application, build_services, enabled_sources
-from qmemo_radar.config import RadarSettings, SourcesConfig, load_sources
+from qmemo_radar.config import RadarSettings, SelectionConfig, SourcesConfig, load_sources
 from qmemo_radar.domain import (
     Engagement,
     FactCheckStatus,
@@ -47,8 +49,14 @@ def build_parser() -> argparse.ArgumentParser:
             "check-config",
             "sample",
             "gaps",
+            "funnel",
+            "clusters",
+            "cluster",
+            "rejected",
+            "prune",
         ),
     )
+    parser.add_argument("target", nargs="?", help="cluster: the cluster id")
     parser.add_argument("--db", type=Path, help="Override SQLite path")
     parser.add_argument(
         "--source", default="gdelt", help="sample: source (gdelt, rss, x) or key (rss:wire)"
@@ -57,6 +65,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--limit", type=_sample_limit, default=20, help=f"sample: 1-{SAMPLE_MAX} items"
     )
     parser.add_argument("--random", action="store_true", help="sample: random instead of newest")
+    parser.add_argument("--hours", type=int, default=24, help="funnel: period (1-720 hours)")
+    parser.add_argument(
+        "--state",
+        choices=("preselected", "candidate", "sibling", "boilerplate"),
+        help="clusters: filter",
+    )
+    parser.add_argument(
+        "--order", choices=("score", "mentions", "recent"), default="score", help="clusters"
+    )
+    parser.add_argument("--reason", help="rejected: one gate reason, e.g. too_few_words")
+    parser.add_argument("--apply", action="store_true", help="prune: really delete")
     parser.add_argument(
         "--skip",
         nargs="+",
@@ -81,11 +100,56 @@ async def execute(
     limit: int = 20,
     random: bool = False,
     skip: list[str] | None = None,
+    target: str | None = None,
+    hours: int = 24,
+    state: str | None = None,
+    order: str = "score",
+    reason: str | None = None,
+    apply: bool = False,
 ) -> int:
     settings = RadarSettings(db_path=db_path) if db_path else RadarSettings()
 
     if command == "gaps":
         return await _gaps(settings, skip=skip)
+
+    if command in ("funnel", "clusters", "cluster", "rejected"):
+        # Read-only audit: never creates, migrates or changes the database.
+        if not settings.db_path.is_file():
+            return _print(
+                {"status": "error", "error": f"database not found: {settings.db_path}"}, 1
+            )
+        repository = SQLiteEventRepository(settings.db_path)
+        limit = min(limit, SAMPLE_MAX)
+        if command == "funnel":
+            return await _funnel(repository, hours=max(1, min(hours, 720)))
+        if command == "clusters":
+            rows = await repository.list_clusters(limit=limit, state=state, order=order)
+            return _print({"status": "ok", "count": len(rows), "clusters": _clip(rows)})
+        if command == "cluster":
+            if not (target or "").isdigit():
+                return _print({"status": "error", "error": "usage: qmemo-radar cluster <id>"}, 2)
+            detail = await repository.cluster_detail(int(str(target)), limit=limit)
+            if detail is None:
+                return _print({"status": "error", "error": f"cluster {target} not found"}, 1)
+            return _print({"status": "ok", "cluster": detail})
+        rows = await repository.rejected_samples(reason=reason, limit=limit)
+        return _print({"status": "ok", "count": len(rows), "samples": rows})
+
+    if command == "prune":
+        repository = SQLiteEventRepository(settings.db_path)
+        await repository.initialize()
+        now = datetime.now(UTC)
+        counts = await repository.prune(_prune_cutoffs(settings, now), apply=apply)
+        return _print(
+            {
+                "status": "ok",
+                "applied": apply,
+                "deleted" if apply else "would_delete": counts,
+                "noise_retention_days": settings.raw_retention_days,
+                "evidence_retention_days": settings.retention_evidence_days,
+                "kept_always": "events a person saw or acted on, their stories and copies",
+            }
+        )
 
     if command == "sample":
         return await _sample(settings, source=source, limit=min(limit, SAMPLE_MAX), random=random)
@@ -123,9 +187,8 @@ async def execute(
                     "cost_month_usd": str(await app.repository.cost_since(month_start(now))),
                     "retention": {
                         "raw_retention_days": settings.raw_retention_days,
-                        "prunable_events": await app.repository.count_prunable_noise(
-                            now - timedelta(days=settings.raw_retention_days)
-                        ),
+                        "evidence_retention_days": settings.retention_evidence_days,
+                        "prunable": "qmemo-radar prune (dry run, counts per category)",
                         "automatic_deletion": False,
                     },
                     "blocked_gaps": {
@@ -284,6 +347,68 @@ async def _gaps(settings: RadarSettings, *, skip: list[str] | None) -> int:
     return 0
 
 
+async def _funnel(repository: SQLiteEventRepository, *, hours: int) -> int:
+    """From raw items to Telegram cards: flow counters for the period and what is stored now."""
+    since = datetime.now(UTC) - timedelta(hours=hours)
+    metrics = await repository.metrics_since(since)
+    total: Counter[str] = Counter()
+    for values in metrics.values():
+        total.update(values)
+    rejected = {
+        name.removeprefix("rejected_"): value
+        for name, value in sorted(total.items())
+        if name.startswith("rejected_")
+    }
+    flow = {
+        "collected": total["collected"],
+        "rejected_before_storage": sum(rejected.values()),
+        "rejected_by_reason": rejected,
+        "invalid_items": total["invalid_items"],
+        "exact_duplicates": total["exact_duplicates"],
+        "exact_copies_kept_as_mentions": total["mentions_aggregated"],
+        "stored_rows": total["inserted"],
+        "filtered_after_storage": total["filtered"],
+        "stories_created": total["clusters_created"],
+        "near_duplicates": total["near_duplicates"],
+        "same_event_texts": total["same_event"],
+        "stories_preselected_updates": total["preselected"],
+        "stories_reopened": total["reopened"],
+        "telegram_delivered": await repository.count_deliveries_since(since),
+    }
+    return _print(
+        {
+            "status": "ok",
+            "hours": hours,
+            "flow": flow,
+            "stored_now": await repository.selection_counts(),
+            "cost_month_usd": str(await repository.cost_since(month_start(datetime.now(UTC)))),
+        }
+    )
+
+
+def _prune_cutoffs(settings: RadarSettings, now: datetime) -> PruneCutoffs:
+    window = SelectionConfig().clustering.window_hours
+    if settings.sources_path.is_file():
+        window = load_sources(settings.sources_path).selection.clustering.window_hours
+    return PruneCutoffs(
+        noise_before=now - timedelta(days=settings.raw_retention_days),
+        evidence_before=now - timedelta(days=settings.retention_evidence_days),
+        index_before=now - timedelta(hours=window),
+    )
+
+
+def _clip(rows: list[dict[str, object]]) -> list[dict[str, object]]:
+    return [
+        {**row, "original_text": str(row.get("original_text", ""))[:SAMPLE_TEXT_CHARS]}
+        for row in rows
+    ]
+
+
+def _print(payload: dict[str, object], code: int = 0) -> int:
+    print(json.dumps(payload, ensure_ascii=False, default=str))
+    return code
+
+
 async def _healthcheck(settings: RadarSettings) -> int:
     """Healthy when the scheduler heartbeat in SQLite is recent. Never creates the database."""
     heartbeat = None
@@ -361,6 +486,12 @@ def main() -> None:
                 limit=args.limit,
                 random=args.random,
                 skip=args.skip,
+                target=args.target,
+                hours=args.hours,
+                state=args.state,
+                order=args.order,
+                reason=args.reason,
+                apply=args.apply,
             )
         )
     )

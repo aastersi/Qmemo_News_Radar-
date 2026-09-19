@@ -147,6 +147,7 @@ async def test_rss_and_atom_entries_become_items(repository: SQLiteEventReposito
     ]
     metrics = await repository.metrics_since(datetime(2000, 1, 1, tzinfo=UTC))
     assert metrics["rss:wire"] == {
+        "clusters_created": 2,
         "collected": 2,
         "entries_accepted": 2,
         "entries_rejected": 1,

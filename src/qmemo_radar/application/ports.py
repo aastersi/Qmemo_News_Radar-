@@ -4,6 +4,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Protocol
 
+from qmemo_radar.application.selection import ClusterSignals
 from qmemo_radar.domain import (
     CostEntry,
     DeliveryKind,
@@ -46,32 +47,141 @@ class KnownEvents:
     ids: frozenset[tuple[str, str]]  # (source, external_id)
     urls: frozenset[tuple[str, str]]  # (source, url)
     content_owners: Mapping[str, str]  # content_hash -> earliest non-duplicate event id
+    # (owner event id, url) of copies already recorded: a re-sent copy is not a new mention.
+    mentions: frozenset[tuple[str, str]] = frozenset()
 
 
-class EventRepository(Protocol):
+@dataclass(frozen=True, slots=True)
+class Mention:
+    """One place a stored text was seen: its own URL or an exact copy elsewhere."""
+
+    event_id: str
+    url: str
+    domain: str
+    article: str
+    source_key: str | None
+    seen_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class PruneCutoffs:
+    """Retention: rows older than these may go (see SQLiteEventRepository.prune)."""
+
+    noise_before: datetime  # filtered, expired and archived events; rejected samples
+    evidence_before: datetime  # stored variants of a story and mentions of exact copies
+    # Band keys of stories not seen since (the clustering window): a derived index only.
+    index_before: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class RejectedSample:
+    reason: str
+    source_key: str | None
+    text: str
+    url: str
+    seen_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class Representative:
+    """The first text of a stored story: what a new text is compared with."""
+
+    cluster_id: int
+    event_id: str
+    text: str
+    language: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class ClusterJoin:
+    event_id: str
+    representative_event_id: str
+    reason: str  # near_duplicate | same_event
+
+
+@dataclass(frozen=True, slots=True)
+class ClusterScore:
+    cluster_id: int
+    state: str  # candidate | preselected | sibling | boilerplate
+    score: int
+    details: Mapping[str, object]
+
+
+class SelectionRepository(Protocol):
+    async def add_rejected_samples(self, samples: Sequence[RejectedSample]) -> None: ...
+
+    async def unclustered_events(self, *, limit: int) -> list[EventCandidate]:
+        """DISCOVERED texts of automated sources not in a cluster yet, oldest first."""
+        ...
+
+    async def representatives(
+        self, band_keys: Sequence[int], *, seen_since: datetime
+    ) -> dict[int, list[Representative]]:
+        """Stories active since `seen_since` whose representative shares a band key."""
+        ...
+
+    async def save_clustering(
+        self,
+        new_clusters: Sequence[tuple[EventCandidate, Sequence[int]]],
+        joins: Sequence[ClusterJoin],
+        *,
+        now: datetime,
+    ) -> int:
+        """Create clusters (representative, band keys) and attach members, in one transaction.
+        Returns how many members were attached (a member no longer DISCOVERED is skipped)."""
+        ...
+
+    async def clusters_of(self, event_ids: Sequence[str]) -> set[int]: ...
+
+    async def unscored_clusters(self, *, limit: int) -> set[int]:
+        """Stories created but never scored (the run that created them failed)."""
+        ...
+
+    async def refresh_clusters(
+        self, cluster_ids: Sequence[int], *, now: datetime
+    ) -> list[ClusterSignals]:
+        """Recompute aggregates from mentions; returns ClusterSignals per cluster."""
+        ...
+
+    async def save_preselection(self, scores: Sequence[ClusterScore]) -> None: ...
+
+    async def preselected_articles(self, articles: Sequence[str]) -> dict[str, int]:
+        """Article -> id of the story already preselected for it (one quote per article)."""
+        ...
+
+    async def reopen_archived(self, event_ids: Sequence[str]) -> int:
+        """ARCHIVED -> DISCOVERED for representatives of stories that grew after ranking."""
+        ...
+
+    async def rank_candidates(self, *, limit: int) -> list[EventCandidate]:
+        """DISCOVERED manual links, then representatives of preselected stories by score."""
+        ...
+
+    async def cluster_signals(
+        self, event_ids: Sequence[str], *, now: datetime
+    ) -> list[ClusterSignals]:
+        """ClusterSignals of stories by representative event id, for the free ranker."""
+        ...
+
+
+class EventRepository(SelectionRepository, Protocol):
     async def initialize(self) -> None: ...
 
     async def add_event(self, event: EventCandidate) -> bool: ...
 
     async def find_known(self, events: Sequence[EventCandidate]) -> KnownEvents: ...
 
-    async def add_events(self, events: Sequence[EventCandidate]) -> int:
+    async def add_events(
+        self, events: Sequence[EventCandidate], mentions: Sequence[Mention] = ()
+    ) -> int:
         """INSERT OR IGNORE all events in one transaction; returns how many rows were new."""
         ...
 
-    async def record_metrics(
-        self, run_id: str, metrics: Mapping[str, Mapping[str, int]]
-    ) -> None:
+    async def record_metrics(self, run_id: str, metrics: Mapping[str, Mapping[str, int]]) -> None:
         """Metric names are `Metric` members or a source's own diagnostic counters."""
         ...
 
     async def metrics_since(self, since: datetime) -> dict[str, dict[str, int]]: ...
-
-    async def count_prunable_noise(self, discovered_before: datetime) -> dict[str, int]:
-        """Events that retention may delete: FILTERED_OUT, EXPIRED or ARCHIVED, discovered before
-        the cutoff, never delivered, never drafted, without feedback or outbox package, and not
-        the original of a stored duplicate. Counted per status; nothing is deleted."""
-        ...
 
     async def list_events_by_status(
         self,

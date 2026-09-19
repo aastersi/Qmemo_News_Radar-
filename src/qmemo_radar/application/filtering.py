@@ -21,6 +21,7 @@ def first_filter_reason(
     policy: FilterPolicy,
     *,
     now: datetime | None = None,
+    check_age: bool = True,
 ) -> str | None:
     current = now or datetime.now(UTC)
     published_at = event.published_at
@@ -28,7 +29,8 @@ def first_filter_reason(
         published_at = published_at.replace(tzinfo=UTC)
 
     # A manually submitted link is an explicit choice, so only automated sources are age-limited.
-    if event.source_key != MANUAL_SOURCE_KEY and published_at < current - policy.max_age:
+    automated = event.source_key != MANUAL_SOURCE_KEY
+    if check_age and automated and published_at < current - policy.max_age:
         return "too_old"
     author_keys = {event.author_handle.casefold() if event.author_handle else None, event.author_id}
     if author_keys & policy.blocked_authors:
@@ -38,4 +40,3 @@ def first_filter_reason(
     if any(term in event.normalized_text for term in policy.blocked_terms):
         return "blocked_term"
     return None
-

@@ -310,14 +310,11 @@ class GdeltQuotationCollector:
                 language=lang,
                 # When GDELT processed the article, not when the outlet published it.
                 published_at=published_at,
+                # Only what the columns lack: quote, URL, language and date are stored there.
                 raw_payload={
                     "title": _context(record.get("title")),
                     "pre": _context(quote.get("pre")),
-                    "quote": text,
                     "post": _context(quote.get("post")),
-                    "url": url,
-                    "lang": lang,
-                    "date": record.get("date"),
                     "gqg_file": name,
                 },
                 source_key=SOURCE_KEY,

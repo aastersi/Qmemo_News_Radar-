@@ -28,6 +28,8 @@ from qmemo_radar.interfaces.telegram.render import status_text
 
 NOW = datetime(2026, 9, 16, 12, 30, 30, tzinfo=UTC)
 UTC_ZONE = ZoneInfo("UTC")
+# Counted by the selection stage after ingestion; the tests here are about the collector.
+SELECTION = {"clusters_created", "preselected", "near_duplicates", "same_event"}
 LAG = timedelta(minutes=10)  # newest minute ever requested: 12:20
 
 
@@ -136,21 +138,24 @@ async def test_quotes_of_a_file_are_stored_one_row_each_and_a_rerun_adds_nothing
 
     assert gdelt.requested[:3] == [minute("12:00"), minute("12:01"), minute("12:02")]
     assert gdelt.requested[20] == minute("12:20") and len(gdelt.requested) == 21
-    assert (first.collected, first.inserted, first.duplicates, first.source_errors) == (3, 3, 1, 0)
+    assert (first.collected, first.inserted, first.duplicates, first.source_errors) == (3, 2, 1, 0)
     assert [row[:4] for row in rows] == [
         ("https://news.example/a", FIRST, None, "ENGLISH"),
         ("https://news.example/a", SECOND, None, "ENGLISH"),
-        ("https://news.example/b", FIRST, None, "ENGLISH"),
     ]
+    # The same quote in article b is provenance of the first row, not a second copy of it.
+    with sqlite3.connect(repository._db_path) as db:
+        mentions = db.execute(
+            "SELECT e.original_text, m.url, m.domain FROM content_mentions m "
+            "JOIN radar_events e ON e.id = m.event_id ORDER BY e.rowid, m.url"
+        ).fetchall()
+    assert mentions == [(FIRST, "https://news.example/b", "news.example")]
     assert rows[0][4] == "2026-09-16T12:05:59+00:00"
+    # Only what the columns lack: the quote, URL, language and date are columns already.
     assert json.loads(str(rows[0][5])) == {
         "title": "Budget",
         "pre": "The minister said ",
-        "quote": FIRST,
         "post": " on Monday.",
-        "url": "https://news.example/a",
-        "lang": "ENGLISH",
-        "date": "2026-09-16T12:05:59Z",
         "gqg_file": minute("12:05"),
     }
     # The cursor is the next minute to check; the rerun starts there and finds nothing new.
@@ -159,14 +164,15 @@ async def test_quotes_of_a_file_are_stored_one_row_each_and_a_rerun_adds_nothing
     assert len(gdelt.requested) == 21  # 12:21 is still inside the safety window
 
     metrics = await repository.metrics_since(datetime(2000, 1, 1, tzinfo=UTC))
-    assert metrics[SOURCE_KEY] == {
+    assert {k: v for k, v in metrics[SOURCE_KEY].items() if k not in SELECTION} == {
         "articles_seen": 2,
         "collected": 3,
         "exact_duplicates": 1,
         "expected_gaps": 20,
         "files_checked": 21,
         "files_found": 1,
-        "inserted": 3,
+        "inserted": 2,
+        "mentions_aggregated": 1,
         "quotes_accepted": 3,
         "quotes_seen": 3,
     }
@@ -278,7 +284,8 @@ async def test_malformed_rows_and_filtered_languages_are_counted_and_skipped(
     assert counters.inserted == 1 and counters.source_errors == 0
     metrics = await repository.metrics_since(datetime(2000, 1, 1, tzinfo=UTC))
     counted = metrics[SOURCE_KEY]
-    assert {k: v for k, v in counted.items() if k not in {"files_checked", "expected_gaps"}} == {
+    skip = {"files_checked", "expected_gaps", *SELECTION}
+    assert {k: v for k, v in counted.items() if k not in skip} == {
         "articles_language_skipped": 2,
         "articles_seen": 5,
         "collected": 1,
