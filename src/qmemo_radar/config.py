@@ -199,11 +199,14 @@ class RssSources(_SourcesModel):
     feeds: tuple[RssFeed, ...] = ()
 
 
-# Generic page furniture that sometimes arrives as a "quote"; nothing topic-specific.
+# Generic page furniture that sometimes arrives as a "quote"; nothing topic-specific. Furniture
+# phrases ("read more", "sign up") count only when they open a short text: in real speech they
+# appear inside sentences (measured on the M4 replay: "...the option to sign up for...").
 DEFAULT_TEMPLATE_PATTERNS = (
     r"^\W*(mon|tue|wed|thu|fri|sat|sun)[a-z]*,? \d{1,2} [a-z]{3,9},? \d{4}",
-    r"\b(click here|read more|sign up for|subscribe to our|all rights reserved|cookie policy)\b",
-    r"\b(javascript|log in to|newsletter|terms of (use|service)|privacy policy)\b",
+    r"^\W*(click here|read more|continue reading|sign up|subscribe|log ?in|newsletter|"
+    r"all rights reserved|cookie policy|privacy policy|terms of (use|service))\b[^.!?]{0,60}\W*$",
+    r"(©|\(c\)|copyright)\s*(19|20)\d{2}",
     r"^\W*(https?://|www\.)\S+\W*$",
 )
 

@@ -284,3 +284,29 @@ def test_the_free_score_is_the_preselection_in_the_ranking_shape() -> None:
     assert score.fact_check_required and score.model_name == "none"
     assert "20 статьях на 25 сайтах" in score.summary and "bbc.co.uk" in score.summary
     assert score.rationale.startswith("Бесплатная оценка без LLM")
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # Real quotes the first template patterns rejected in the M4 replay audit.
+        "There is a sign up for people not to feed the geese, but it seems that people can't read",
+        "We know both residents and businesses have been asking for the option to sign up for "
+        "Montana-made renewable energy.",
+        "Sometimes the easiest way to read more is simply to make books part of the things you "
+        "already enjoy doing.",
+        "No one can download it(the material), share it and pass on the log in to others, you "
+        "just have to watch it on the platform,",
+    ],
+)
+def test_furniture_words_inside_real_speech_are_not_templates(text: str) -> None:
+    assert gate_reason(item(text), POLICY, now=NOW) is None
+
+
+def test_page_furniture_is_a_template() -> None:
+    for text in (
+        "Read more about the council vote here",
+        "Subscribe to our newsletter for daily updates",
+        "Copyright 2026 Example Media Group, all rights",
+    ):
+        assert gate_reason(item(text), POLICY, now=NOW) == "template", text
