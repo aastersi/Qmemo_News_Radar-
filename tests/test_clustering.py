@@ -372,3 +372,55 @@ async def test_a_preselected_story_that_cools_down_keeps_its_place(
     # The score fell (freshness, momentum), the state did not: it was ranked and holds the article.
     assert state == "preselected" and score < 65
     assert query(repository, "SELECT status FROM radar_events") == [("SHORTLISTED",)]
+
+
+async def test_real_gdelt_and_rss_collectors_reach_telegram_through_free_ranking(
+    repository: SQLiteEventRepository,
+) -> None:
+    from test_gdelt import NOW as GDELT_NOW
+    from test_gdelt import Gdelt, gz, minute
+    from test_rss import RSS, Web, ok
+
+    from qmemo_radar.application.collection import MultiSourceCollector
+    from qmemo_radar.bootstrap import selection_policy
+    from qmemo_radar.config import SourcesConfig
+
+    statement = "We will cut emissions by half before 2030 and we will not step back from it"
+    articles = [
+        {
+            "date": "2026-09-16T12:05:59Z",
+            "url": f"https://paper{n}.example/climate",
+            "title": f"Paper {n}: the minister on climate",
+            "lang": "ENGLISH",
+            "quotes": [{"pre": "The minister said ", "quote": statement, "post": "."}],
+        }
+        for n in range(8)
+    ]
+    gdelt = Gdelt({minute("12:05"): gz(*articles)}).collector()
+    rss = Web({"https://wire.example/rss": ok(RSS)}).collector(("wire", "https://wire.example/rss"))
+    policy = selection_policy(SourcesConfig().selection)
+    pipeline = RadarPipeline(
+        collector=MultiSourceCollector({"gdelt_gqg": gdelt, "rss": rss}),
+        ranker=FreeRanker(repository, policy, clock=lambda: GDELT_NOW),
+        repository=repository,
+        filter_policy=FilterPolicy(max_age=timedelta(days=36500)),
+        thresholds=PipelineThresholds(),
+        selection=policy,
+        clock=lambda: GDELT_NOW,
+    )
+
+    counters = await pipeline.run_once()
+
+    assert counters.source_errors == 0 and counters.shortlisted == 1
+    [(text, status, articles_count)] = query(
+        repository,
+        "SELECT e.original_text, e.status, c.article_count FROM event_clusters c "
+        "JOIN radar_events e ON e.id = c.representative_event_id WHERE e.status = 'SHORTLISTED'",
+    )
+    assert (text, articles_count) == (statement, 8)
+    # The RSS entries were stored and clustered too; one outlet each is not enough to rank.
+    assert query(repository, "SELECT COUNT(*) FROM radar_events WHERE source = 'rss'") == [(2,)]
+    gateway = FakeGateway()
+    assert await review_service(repository, gateway).deliver(urgent=False) == 1
+    assert gateway.cards[0][0].event.original_text == statement
+    assert await repository.cost_since(month_start(datetime.now(UTC))) == Decimal(0)
