@@ -111,7 +111,9 @@ def rows(repository: SQLiteEventRepository) -> list[tuple[object, ...]]:
 
 async def test_rss_and_atom_entries_become_items(repository: SQLiteEventRepository) -> None:
     web = Web({"https://wire.example/rss": ok(RSS), "https://blog.example/atom": ok(ATOM)})
-    collector = web.collector(("wire", "https://wire.example/rss"), ("blog", "https://blog.example/atom"))
+    collector = web.collector(
+        ("wire", "https://wire.example/rss"), ("blog", "https://blog.example/atom")
+    )
 
     counters = await pipeline(collector, repository).run_once()
 
@@ -173,7 +175,9 @@ async def test_etag_and_last_modified_are_sent_back_and_304_is_a_quiet_success(
         return httpx.Response(200, content=ATOM, headers={"Last-Modified": modified})
 
     web = Web({"https://wire.example/rss": feed, "https://blog.example/atom": blog})
-    collector = web.collector(("wire", "https://wire.example/rss"), ("blog", "https://blog.example/atom"))
+    collector = web.collector(
+        ("wire", "https://wire.example/rss"), ("blog", "https://blog.example/atom")
+    )
 
     first = await pipeline(collector, repository).run_once()
     checkpoints = await repository.get_checkpoints()
@@ -368,3 +372,39 @@ async def test_a_compressed_response_is_capped_while_it_is_decoded() -> None:
     assert by_key["rss:br"].error_code == "rss_unsupported_encoding"
     assert peak < 8 * 1024 * 1024  # never near the 50 MB the bomb expands to
     assert web.requests[0].headers["accept-encoding"] == "gzip, deflate"
+
+
+async def test_truncated_several_member_and_raw_deflate_bodies_are_decoded_correctly() -> None:
+    # Independent review: a gzip body cut off mid-stream was accepted as a shorter feed, the
+    # second member of a multi-member gzip was dropped, and raw deflate was refused.
+    import gzip
+    import zlib
+
+    def encoded(body: bytes, encoding: str) -> Callable[[httpx.Request], httpx.Response]:
+        headers = {"Content-Encoding": encoding}
+        return lambda request: httpx.Response(200, stream=httpx.ByteStream(body), headers=headers)
+
+    whole = gzip.compress(RSS)
+    half = len(RSS) // 2
+    members = gzip.compress(RSS[:half]) + gzip.compress(RSS[half:])
+    raw = zlib.compressobj(wbits=-15)
+    deflated = raw.compress(RSS) + raw.flush()
+    web = Web(
+        {
+            "https://cut.example/rss": encoded(whole[: len(whole) // 2], "gzip"),
+            "https://members.example/rss": encoded(members, "gzip"),
+            "https://raw.example/rss": encoded(deflated, "deflate"),
+            "https://zlib.example/rss": encoded(zlib.compress(RSS), "deflate"),
+        }
+    )
+
+    fetches = await web.collector(
+        ("cut", "https://cut.example/rss"),
+        ("members", "https://members.example/rss"),
+        ("raw", "https://raw.example/rss"),
+        ("zlib", "https://zlib.example/rss"),
+    ).collect({})
+
+    by_key = {fetch.source_key: fetch for fetch in fetches}
+    assert by_key["rss:cut"].error_code == "rss_decode_error"
+    assert [len(by_key[f"rss:{name}"].items) for name in ("members", "raw", "zlib")] == [2, 2, 2]

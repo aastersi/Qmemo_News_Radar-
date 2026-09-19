@@ -142,8 +142,9 @@ async def _read_limited(response: httpx.Response, max_bytes: int) -> bytes:
     encoding = response.headers.get("content-encoding", "").strip().lower()
     if encoding not in ("", "identity", "gzip", "x-gzip", "deflate"):
         raise HttpFailure("unsupported_encoding", response.status_code)
-    # wbits 47: zlib or gzip header, detected automatically.
-    decoder = zlib.decompressobj(47) if encoding not in ("", "identity") else None
+    decoder = (
+        _Decoder(raw_fallback=encoding == "deflate") if encoding not in ("", "identity") else None
+    )
     body = bytearray()
     try:
         async for raw in response.aiter_raw():
@@ -151,14 +152,44 @@ async def _read_limited(response: httpx.Response, max_bytes: int) -> bytes:
                 body += raw
             else:
                 # Never decode more than one byte past the limit, however small `raw` is.
-                body += decoder.decompress(raw, max_bytes + 1 - len(body))
+                body += decoder.feed(raw, max_bytes + 1 - len(body))
             if len(body) > max_bytes:
                 raise HttpFailure("response_too_large", response.status_code)
-        if decoder is not None:
-            body += decoder.flush()  # input is fully consumed here, so this is tiny
+        if decoder is not None and not decoder.finished:
+            raise HttpFailure("decode_error", response.status_code)  # cut off mid-stream
     except zlib.error as exc:
         raise HttpFailure("decode_error", response.status_code) from exc
-    if len(body) > max_bytes:
-        raise HttpFailure("response_too_large", response.status_code)
     return bytes(body)
 
+
+class _Decoder:
+    """gzip or zlib (several gzip members in a row allowed), or raw deflate, which some servers
+    send as `deflate`. The caller bounds the output of every call."""
+
+    def __init__(self, *, raw_fallback: bool) -> None:
+        self._raw_fallback = raw_fallback
+        self._started = False
+        self._stream = zlib.decompressobj(47)  # zlib or gzip header, detected automatically
+
+    @property
+    def finished(self) -> bool:
+        return self._stream.eof
+
+    def feed(self, data: bytes, limit: int) -> bytes:
+        out = bytearray()
+        while data and len(out) < limit:
+            try:
+                out += self._stream.decompress(data, limit - len(out))
+            except zlib.error:
+                if not (self._raw_fallback and not self._started):
+                    raise
+                self._raw_fallback = False
+                self._stream = zlib.decompressobj(-15)
+                continue
+            self._started = True
+            if self._stream.eof and self._stream.unused_data:
+                data = self._stream.unused_data  # the next gzip member
+                self._stream = zlib.decompressobj(47)
+            else:
+                data = self._stream.unconsumed_tail
+        return bytes(out)
