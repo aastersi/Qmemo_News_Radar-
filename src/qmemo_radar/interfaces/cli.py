@@ -22,6 +22,8 @@ from qmemo_radar.domain import (
     SourceType,
 )
 from qmemo_radar.infrastructure.collectors import FakeCollector
+from qmemo_radar.infrastructure.collectors.gdelt_gqg import SOURCE_KEY as GDELT_KEY
+from qmemo_radar.infrastructure.collectors.gdelt_gqg import GdeltCursor
 from qmemo_radar.infrastructure.drafting import DeterministicDraftWriter
 from qmemo_radar.infrastructure.ranking import DeterministicFixtureRanker
 from qmemo_radar.infrastructure.storage import SQLiteEventRepository
@@ -36,7 +38,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="qmemo-radar")
     parser.add_argument(
         "command",
-        choices=("init-db", "status", "dry-run", "run", "healthcheck", "check-config", "sample"),
+        choices=(
+            "init-db",
+            "status",
+            "dry-run",
+            "run",
+            "healthcheck",
+            "check-config",
+            "sample",
+            "gaps",
+        ),
     )
     parser.add_argument("--db", type=Path, help="Override SQLite path")
     parser.add_argument(
@@ -46,6 +57,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--limit", type=_sample_limit, default=20, help=f"sample: 1-{SAMPLE_MAX} items"
     )
     parser.add_argument("--random", action="store_true", help="sample: random instead of newest")
+    parser.add_argument(
+        "--skip",
+        nargs="+",
+        metavar="MINUTE",
+        help="gaps: give up on blocked GDELT minutes (YYYYMMDDHHMMSS, or all); recorded",
+    )
     return parser
 
 
@@ -63,8 +80,12 @@ async def execute(
     source: str = "gdelt",
     limit: int = 20,
     random: bool = False,
+    skip: list[str] | None = None,
 ) -> int:
     settings = RadarSettings(db_path=db_path) if db_path else RadarSettings()
+
+    if command == "gaps":
+        return await _gaps(settings, skip=skip)
 
     if command == "sample":
         return await _sample(settings, source=source, limit=min(limit, SAMPLE_MAX), random=random)
@@ -106,6 +127,11 @@ async def execute(
                             now - timedelta(days=settings.raw_retention_days)
                         ),
                         "automatic_deletion": False,
+                    },
+                    "blocked_gaps": {
+                        health.source_key: health.blocked_gaps
+                        for health in await app.repository.source_health()
+                        if health.blocked_gaps
                     },
                     "cost_hard_limit_usd_monthly": str(settings.cost_hard_limit_usd_monthly),
                     "qmemo_publishing": settings.qmemo_publishing_enabled,
@@ -219,6 +245,45 @@ async def _sample(settings: RadarSettings, *, source: str, limit: int, random: b
     return 0
 
 
+async def _gaps(settings: RadarSettings, *, skip: list[str] | None) -> int:
+    """Blocked GDELT minutes: listed, or skipped on explicit request (never automatically).
+
+    ponytail: a collection running at this moment may write its own cursor after the skip; the
+    minute then stays listed and the command can simply be repeated.
+    """
+    if not settings.db_path.is_file():
+        print(json.dumps({"status": "error", "error": f"database not found: {settings.db_path}"}))
+        return 1
+    repository = SQLiteEventRepository(settings.db_path)
+    skipped: list[str] = []
+
+    def edit(value: str | None) -> str | None:
+        state = GdeltCursor.parse(value)
+        wanted = list(state.blocked) if skip == ["all"] else skip or []
+        skipped.extend(state.skip(wanted, at=datetime.now(UTC)))
+        return state.dump() if value is not None else None
+
+    if skip:
+        await repository.initialize()
+        await repository.edit_cursor(GDELT_KEY, edit)
+    state = GdeltCursor.parse((await repository.get_checkpoints()).get(GDELT_KEY))
+    print(
+        json.dumps(
+            {
+                "status": "ok",
+                "source_key": GDELT_KEY,
+                "next_minute": state.next.strftime("%Y%m%d%H%M%S") if state.next else None,
+                "failed_attempts": state.attempts,
+                "blocked": state.blocked,
+                "skipped_now": skipped,
+                "skipped_before": state.skipped,
+            },
+            ensure_ascii=False,
+        )
+    )
+    return 0
+
+
 async def _healthcheck(settings: RadarSettings) -> int:
     """Healthy when the scheduler heartbeat in SQLite is recent. Never creates the database."""
     heartbeat = None
@@ -295,6 +360,7 @@ def main() -> None:
                 source=args.source,
                 limit=args.limit,
                 random=args.random,
+                skip=args.skip,
             )
         )
     )

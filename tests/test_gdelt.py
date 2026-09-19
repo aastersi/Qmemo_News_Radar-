@@ -5,6 +5,7 @@ import json
 import sqlite3
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
@@ -13,11 +14,20 @@ from qmemo_radar.application.collection import MultiSourceCollector
 from qmemo_radar.application.filtering import FilterPolicy
 from qmemo_radar.application.pipeline import PipelineThresholds, RadarPipeline
 from qmemo_radar.application.ports import SourceCollector
+from qmemo_radar.application.runner import StatusReport
+from qmemo_radar.domain import PipelineCounters
 from qmemo_radar.infrastructure.collectors import gdelt_gqg
-from qmemo_radar.infrastructure.collectors.gdelt_gqg import SOURCE_KEY, GdeltQuotationCollector
+from qmemo_radar.infrastructure.collectors.gdelt_gqg import (
+    SOURCE_KEY,
+    GdeltCursor,
+    GdeltQuotationCollector,
+)
 from qmemo_radar.infrastructure.storage import SQLiteEventRepository
+from qmemo_radar.interfaces.cli import execute
+from qmemo_radar.interfaces.telegram.render import status_text
 
 NOW = datetime(2026, 9, 16, 12, 30, 30, tzinfo=UTC)
+UTC_ZONE = ZoneInfo("UTC")
 LAG = timedelta(minutes=10)  # newest minute ever requested: 12:20
 
 
@@ -91,6 +101,12 @@ def pipeline(collector: SourceCollector, repository: SQLiteEventRepository) -> R
         filter_policy=FilterPolicy(max_age=timedelta(days=36500)),
         thresholds=PipelineThresholds(),
     )
+
+
+async def cursor_of(repository: SQLiteEventRepository) -> tuple[str | None, int, object]:
+    state = GdeltCursor.parse((await repository.get_checkpoints()).get(SOURCE_KEY))
+    nxt = state.next.strftime("%Y%m%d%H%M%S") if state.next else None
+    return (nxt, state.attempts, state.blocked)
 
 
 def stored(repository: SQLiteEventRepository) -> list[tuple[object, ...]]:
@@ -216,12 +232,12 @@ async def test_a_failing_minute_is_retried_never_skipped(
     retries = gdelt.requested.count(minute("12:04"))
     assert (first.inserted, first.source_errors) == (1, 1)
     # Progress up to the failure is kept, the failing minute becomes the cursor.
-    assert await repository.get_checkpoints() == {SOURCE_KEY: minute("12:04")}
+    assert await cursor_of(repository) == (minute("12:04"), 1, {})
     assert minute("12:05") not in gdelt.requested
 
     second = await pipeline(gdelt.collector(), repository).run_once()
     assert gdelt.requested.count(minute("12:04")) == 2 * retries
-    assert await repository.get_checkpoints() == {SOURCE_KEY: minute("12:04")}
+    assert await cursor_of(repository) == (minute("12:04"), 2, {})
     [health] = [h for h in await repository.source_health() if h.source_key == SOURCE_KEY]
     # No progress in the second run, so the failures keep counting up.
     assert (health.last_error, health.consecutive_failures) == (code, 2)
@@ -482,3 +498,116 @@ def test_gdelt_must_check_at_least_one_collection_interval_per_run() -> None:
             collect_interval_minutes=90,
         )
     RadarSettings(_env_file=None, collect_interval_minutes=90)  # type: ignore[call-arg]
+
+
+async def test_a_permanently_failing_minute_becomes_a_visible_blocked_gap(
+    repository: SQLiteEventRepository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Regression: one minute answering 403 forever stopped the cursor forever.
+    gdelt = Gdelt(
+        {
+            minute("12:04"): 403,
+            minute("12:06"): gz(article("https://news.example/b", SECOND)),
+        }
+    )
+    for _ in range(2):  # below the threshold: the cursor waits on 12:04
+        await pipeline(gdelt.collector(), repository).run_once()
+    assert await cursor_of(repository) == (minute("12:04"), 2, {})
+
+    third = await pipeline(gdelt.collector(), repository).run_once()
+    nxt, attempts, blocked = await cursor_of(repository)
+    assert (nxt, attempts, third.inserted, third.source_errors) == (minute("12:21"), 0, 1, 0)
+    assert blocked == {
+        minute("12:04"): {"reason": "gdelt_http_403", "attempts": 3, "since": NOW.isoformat()}
+    }
+
+    [health] = [h for h in await repository.source_health() if h.source_key == SOURCE_KEY]
+    assert (health.blocked_gaps, health.consecutive_failures) == (1, 0)
+    report = StatusReport(
+        paused=False,
+        heartbeat_at=None,
+        last_run=None,
+        last_success=None,
+        sources=[health],
+        today=PipelineCounters(),
+        sent_today=0,
+        outbox_approved=0,
+        qmemo_publishing_enabled=False,
+        x_publishing_enabled=False,
+    )
+    assert "gdelt:gqg: работает; заблокировано минут: 1" in status_text(report, timezone=UTC_ZONE)
+
+    # Every later run gives it exactly one more try; the data is never silently dropped.
+    before = gdelt.requested.count(minute("12:04"))
+    await pipeline(gdelt.collector(), repository).run_once()
+    assert gdelt.requested.count(minute("12:04")) == before + 1
+    assert (await cursor_of(repository))[2][minute("12:04")]["attempts"] == 4
+
+    gdelt.files[minute("12:04")] = gz(article("https://news.example/late", FIRST))
+    recovered = await pipeline(gdelt.collector(), repository).run_once()
+    assert recovered.inserted == 1
+    assert await cursor_of(repository) == (minute("12:21"), 0, {})
+    metrics = await repository.metrics_since(datetime(2000, 1, 1, tzinfo=UTC))
+    assert (metrics[SOURCE_KEY]["gaps_blocked"], metrics[SOURCE_KEY]["gaps_recovered"]) == (1, 1)
+
+
+async def test_an_outage_fills_the_blocked_list_then_stops_visibly(
+    repository: SQLiteEventRepository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(gdelt_gqg, "MAX_BLOCKED_MINUTES", 1)
+    gdelt = Gdelt({minute(f"12:{m:02d}"): 503 for m in range(21)})
+    for _ in range(3):
+        await pipeline(gdelt.collector(), repository).run_once()
+    assert await cursor_of(repository) == (minute("12:01"), 1, {minute("12:00"): ANY_ENTRY})
+
+    for _ in range(2):
+        last = await pipeline(gdelt.collector(), repository).run_once()
+    # 12:01 reached the threshold, but the list is full: the collector stops and says why.
+    assert await cursor_of(repository) == (minute("12:01"), 3, {minute("12:00"): ANY_ENTRY})
+    health = {item.source_key: item for item in await repository.source_health()}
+    assert health[SOURCE_KEY].last_error == "gdelt_blocked_gaps_full"
+    assert last.source_errors == 1
+
+
+async def test_the_gaps_command_lists_and_skips_blocked_minutes_on_request(
+    repository: SQLiteEventRepository, capsys: pytest.CaptureFixture[str]
+) -> None:
+    gdelt = Gdelt({minute("12:04"): 403})
+    for _ in range(3):
+        await pipeline(gdelt.collector(), repository).run_once()
+
+    assert await execute("gaps", db_path=repository._db_path) == 0
+    listed = json.loads(capsys.readouterr().out)
+    assert list(listed["blocked"]) == [minute("12:04")] and listed["skipped_now"] == []
+
+    assert await execute("gaps", db_path=repository._db_path, skip=["all"]) == 0
+    done = json.loads(capsys.readouterr().out)
+    assert (done["blocked"], done["skipped_now"]) == ({}, [minute("12:04")])
+    assert done["skipped_before"][minute("12:04")]["reason"] == "gdelt_http_403"
+    assert await cursor_of(repository) == (minute("12:21"), 0, {})
+    # Skipped means skipped: the next run does not request it again.
+    before = gdelt.requested.count(minute("12:04"))
+    await pipeline(gdelt.collector(), repository).run_once()
+    assert gdelt.requested.count(minute("12:04")) == before
+
+
+def test_skipping_a_blocked_minute_keeps_a_record() -> None:
+    state = GdeltCursor.parse(
+        '{"next": "20260916122100", "attempts": 0, "blocked": {"20260916120400":'
+        ' {"reason": "gdelt_http_403", "attempts": 7, "since": "x"}}, "skipped": {}}'
+    )
+    assert state.skip(["20260916120400", "20260916120500"], at=NOW) == ["20260916120400"]
+    again = GdeltCursor.parse(state.dump())
+    assert again.blocked == {}
+    assert again.skipped["20260916120400"]["skipped_at"] == NOW.isoformat()
+    assert again.skipped["20260916120400"]["reason"] == "gdelt_http_403"
+    # A plain cursor from before blocked gaps existed still reads, and writes back unchanged.
+    assert GdeltCursor.parse("20260916122100").dump() == "20260916122100"
+
+
+class _Any:
+    def __eq__(self, other: object) -> bool:
+        return True
+
+
+ANY_ENTRY = _Any()

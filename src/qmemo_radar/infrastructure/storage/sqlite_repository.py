@@ -366,14 +366,15 @@ class SQLiteEventRepository:
                 await db.execute(
                     """
                     INSERT INTO source_checkpoints (
-                        source_key, last_error_at, last_error, consecutive_failures
-                    ) VALUES (?, ?, ?, 1)
+                        source_key, cursor_value, last_error_at, last_error, consecutive_failures
+                    ) VALUES (?, ?, ?, ?, 1)
                     ON CONFLICT(source_key) DO UPDATE SET
+                        cursor_value = COALESCE(excluded.cursor_value, cursor_value),
                         last_error_at = excluded.last_error_at,
                         last_error = excluded.last_error,
                         consecutive_failures = consecutive_failures + 1
                     """,
-                    (source_key, now, error_code),
+                    (source_key, cursor, now, error_code),
                 )
             await db.commit()
 
@@ -960,9 +961,30 @@ class SQLiteEventRepository:
         async with self._connect() as db:
             rows = await db.execute_fetchall("SELECT * FROM source_checkpoints ORDER BY source_key")
         return [
-            SourceHealth.model_validate({k: v for k, v in dict(row).items() if k != "cursor_value"})
+            SourceHealth.model_validate(
+                {k: v for k, v in dict(row).items() if k != "cursor_value"}
+                | {"blocked_gaps": _blocked_gaps(row["cursor_value"])}
+            )
             for row in rows
         ]
+
+    async def edit_cursor(
+        self, source_key: str, edit: Callable[[str | None], str | None]
+    ) -> str | None:
+        """Read-modify-write one cursor in a single write transaction (operator commands)."""
+        async with self._transaction() as db:
+            rows = list(
+                await db.execute_fetchall(
+                    "SELECT cursor_value FROM source_checkpoints WHERE source_key = ?",
+                    (source_key,),
+                )
+            )
+            value = edit(str(rows[0][0]) if rows and rows[0][0] is not None else None)
+            await db.execute(
+                "UPDATE source_checkpoints SET cursor_value = ? WHERE source_key = ?",
+                (value, source_key),
+            )
+        return value
 
     @classmethod
     def _scored_from_row(cls, row: aiosqlite.Row) -> ScoredEvent:
@@ -1071,6 +1093,17 @@ def _event_row(event: EventCandidate, now: str) -> tuple[object, ...]:
         event.filter_reason,
         event.duplicate_of_event_id,
     )
+
+
+def _blocked_gaps(cursor: object) -> int:
+    """A source keeps parked failures under `blocked` in a JSON cursor (see GdeltCursor)."""
+    if not isinstance(cursor, str) or not cursor.startswith("{"):
+        return 0
+    try:
+        blocked = json.loads(cursor).get("blocked")
+    except (ValueError, AttributeError):
+        return 0
+    return len(blocked) if isinstance(blocked, dict) else 0
 
 
 def _placeholders(values: Sequence[str]) -> str:

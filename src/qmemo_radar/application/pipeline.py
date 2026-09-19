@@ -67,8 +67,9 @@ class RadarPipeline:
             stats.update(fetch.stats)
             if fetch.error_code:
                 stats[Metric.SOURCE_ERRORS] += 1
+                # A cursor on a failed fetch is state that must survive it (e.g. failed attempts).
                 await self._repository.record_source_result(
-                    fetch.source_key, cursor=None, error_code=fetch.error_code
+                    fetch.source_key, cursor=fetch.cursor, error_code=fetch.error_code
                 )
                 logger.warning(
                     "source failed",

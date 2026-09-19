@@ -58,7 +58,11 @@ class RawSourceItem(DomainModel):
 
 
 class SourceFetch(DomainModel):
-    """One configured source query. Its cursor is saved only after all items are stored."""
+    """One configured source query. Its cursor is saved only after all items are stored.
+
+    A failed fetch (error_code) may carry a cursor too: source state that must survive the
+    failure, such as failed attempts. It is saved without counting as a success.
+    """
 
     source_key: str = Field(min_length=1, max_length=80)
     items: tuple[RawSourceItem, ...] = ()
@@ -222,3 +226,5 @@ class SourceHealth(DomainModel):
     last_error_at: datetime | None = None
     last_error: str | None = None
     consecutive_failures: int = 0
+    # Parts of the source that failed repeatedly and are parked for an operator (GDELT minutes).
+    blocked_gaps: int = 0

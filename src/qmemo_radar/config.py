@@ -73,6 +73,9 @@ class RadarSettings(BaseSettings):
     # Comma-separated GDELT language names (e.g. English,Spanish), case-insensitive; * = all.
     gdelt_languages: str = "English"
     gdelt_allow_unknown_language: bool = False
+    # A minute failing (403, 5xx, network) in this many runs in a row is parked as a blocked gap,
+    # retried once per run and listed by `qmemo-radar gaps`; collection moves on meanwhile.
+    gdelt_block_after_failures: int = Field(default=3, ge=2, le=100)
     rss_max_response_bytes: int = Field(default=5_000_000, ge=10_000, le=5_000_000)
 
     @model_validator(mode="after")

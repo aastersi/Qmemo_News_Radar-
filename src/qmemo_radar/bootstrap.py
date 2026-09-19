@@ -214,6 +214,7 @@ def _build_gdelt(context: SourceContext) -> SourceCollector:
         first_run_lookback=timedelta(minutes=settings.max_event_age_minutes),
         languages=settings.gdelt_language_set,
         allow_unknown_language=settings.gdelt_allow_unknown_language,
+        block_after_failures=settings.gdelt_block_after_failures,
     )
 
 
