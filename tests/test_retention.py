@@ -13,7 +13,9 @@ from qmemo_radar.infrastructure.storage import SQLiteEventRepository
 
 
 def everything_older_than(moment: datetime) -> PruneCutoffs:
-    return PruneCutoffs(noise_before=moment, evidence_before=moment, index_before=moment)
+    return PruneCutoffs(
+        noise_before=moment, evidence_before=moment, index_before=moment, metrics_before=moment
+    )
 
 
 def table_sizes(repository: SQLiteEventRepository) -> dict[str, int]:
@@ -71,6 +73,8 @@ async def test_prune_counts_first_and_never_deletes_what_a_person_touched(
         "1007": "near_duplicate",
     }
     before = table_sizes(repository)
+    with sqlite3.connect(repository._db_path) as db:
+        [(metric_rows,)] = db.execute("SELECT COUNT(*) FROM pipeline_metrics").fetchall()
     later = everything_older_than(datetime.now(UTC) + timedelta(days=1))
 
     counted = await repository.prune(later, apply=False)
@@ -90,6 +94,8 @@ async def test_prune_counts_first_and_never_deletes_what_a_person_touched(
             "stories": 2,  # of 1002 and 1004
             "noise_events": 3,  # 1001, 1002, 1004
             "band_keys": 24,  # of the three stories (8 each), all older than the cutoff
+            "metrics": metric_rows,  # flow counters of the run, older than the cutoff
+            "runs": 0,  # run_once alone records no pipeline_runs row
         }
     )
     with sqlite3.connect(repository._db_path) as db:
@@ -140,3 +146,22 @@ async def test_prune_stays_fast_on_a_large_table(repository: SQLiteEventReposito
 
     assert counts["noise_events"] == 27_000  # the 3,000 originals of stored copies are kept
     assert elapsed < 5  # without the 008 indexes this took minutes (a scan per candidate)
+
+
+async def test_the_prune_count_never_waits_for_the_write_lock(
+    repository: SQLiteEventRepository,
+) -> None:
+    # Independent review: the dry run deleted and rolled back inside BEGIN IMMEDIATE, holding
+    # the write lock longer than a collection waits for it.
+    writer = sqlite3.connect(repository._db_path, timeout=0)
+    writer.execute("BEGIN IMMEDIATE")  # a collection writing right now
+    try:
+        started = time.perf_counter()
+        counts = await repository.prune(
+            everything_older_than(datetime.now(UTC) + timedelta(days=1)), apply=False
+        )
+        assert time.perf_counter() - started < 2
+    finally:
+        writer.rollback()
+        writer.close()
+    assert counts["noise_events"] == 0

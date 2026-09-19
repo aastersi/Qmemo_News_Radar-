@@ -1487,7 +1487,8 @@ class SQLiteEventRepository:
         Never touched: anything a person saw or acted on (Telegram delivery, draft, feedback,
         outbox package), the stories and copies of such events, and everything newer than the
         cutoffs. Deleting an event deletes its score, mentions and, for a representative, its
-        story and band keys (foreign keys).
+        story (foreign keys). The count only reads; deleting goes in short transactions of
+        PRUNE_BATCH rows, so a running collection is never locked out for long.
         """
         evidence = _iso(cutoffs.evidence_before)
         noise = _iso(cutoffs.noise_before)
@@ -1507,52 +1508,58 @@ class SQLiteEventRepository:
               AND (c.id IS NULL OR NOT {_HUMAN.format(event="c.representative_event_id")})
         """
         statuses = ",".join(f"'{status.value}'" for status in _NOISE)
+        # A row still referenced as the original of another stays; variants deleted above do not
+        # count (the count, which deletes nothing, must see what the deletion will see).
         noise_rows = f"""
             SELECT e.id FROM radar_events e
             WHERE e.status IN ({statuses}) AND e.discovered_at < ?
               AND COALESCE(e.filter_reason, '') NOT IN ('near_duplicate', 'same_event')
               AND NOT {_HUMAN.format(event="e.id")}
-              AND NOT EXISTS (SELECT 1 FROM radar_events x WHERE x.duplicate_of_event_id = e.id)
+              AND NOT EXISTS (
+                  SELECT 1 FROM radar_events x WHERE x.duplicate_of_event_id = e.id
+                  AND x.id NOT IN ({members})
+              )
         """
         stories = f"""
             SELECT c.id FROM event_clusters c WHERE c.representative_event_id IN ({noise_rows})
         """
         samples = "SELECT id FROM rejected_samples WHERE seen_at < ?"
         # Keys only find stories active within the clustering window, so older keys are dead
-        # weight; the keys of stories deleted below go too (no foreign key on this index).
+        # weight; the keys of stories deleted with their representative go too (no foreign key).
         stale_keys = """
             SELECT band_key, cluster_id FROM cluster_keys WHERE cluster_id NOT IN (
                 SELECT id FROM event_clusters WHERE last_seen_at >= ?
             )
         """
+        metrics = "SELECT run_id, source_key, metric FROM pipeline_metrics WHERE recorded_at < ?"
+        runs = "SELECT id FROM pipeline_runs WHERE started_at < ? AND status != 'RUNNING'"
+        index, kept = _iso(cutoffs.index_before), _iso(cutoffs.metrics_before)
+        categories: tuple[tuple[str, str, tuple[str, ...], str | None, tuple[str, ...]], ...] = (
+            ("duplicate_texts", members, (evidence,), "radar_events", ("id",)),
+            ("copy_mentions", copies, (evidence,), "content_mentions", ("event_id", "url")),
+            ("rejected_samples", samples, (noise,), "rejected_samples", ("id",)),
+            ("stories", stories, (noise, evidence), None, ()),
+            ("noise_events", noise_rows, (noise, evidence), "radar_events", ("id",)),
+            ("band_keys", stale_keys, (index,), "cluster_keys", ("band_key", "cluster_id")),
+            ("metrics", metrics, (kept,), "pipeline_metrics", ("run_id", "source_key", "metric")),
+            ("runs", runs, (kept,), "pipeline_runs", ("id",)),
+        )
         counts: dict[str, int] = {}
-        # The dry run deletes too and rolls back, so it counts exactly what --apply removes
-        # (a story representative becomes deletable only once its copies are gone).
-        async with self._transaction() as db:
-            for name, query, value, delete in (
-                ("duplicate_texts", members, evidence, "DELETE FROM radar_events WHERE id IN"),
-                (
-                    "copy_mentions",
-                    copies,
-                    evidence,
-                    "DELETE FROM content_mentions WHERE (event_id, url) IN",
-                ),
-                ("rejected_samples", samples, noise, "DELETE FROM rejected_samples WHERE id IN"),
-                ("stories", stories, noise, None),
-                ("noise_events", noise_rows, noise, "DELETE FROM radar_events WHERE id IN"),
-                (
-                    "band_keys",
-                    stale_keys,
-                    _iso(cutoffs.index_before),
-                    "DELETE FROM cluster_keys WHERE (band_key, cluster_id) IN",
-                ),
-            ):
-                [(count,)] = await db.execute_fetchall(f"SELECT COUNT(*) FROM ({query})", (value,))
-                counts[name] = int(count)
-                if delete:
-                    await db.execute(f"{delete} ({query})", (value,))
-            if not apply:
-                await db.rollback()
+        for name, query, values, table, key in categories:
+            async with self._connect() as db:
+                keys = [tuple(row) for row in await db.execute_fetchall(query, values)]
+            counts[name] = len(keys)
+            if not apply or table is None:
+                continue
+            columns = f"({', '.join(key)})" if len(key) > 1 else key[0]
+            for start in range(0, len(keys), PRUNE_BATCH):
+                chunk = keys[start : start + PRUNE_BATCH]
+                rows = ",".join(f"({', '.join('?' for _ in key)})" for _ in chunk)
+                async with self._transaction() as db:
+                    await db.execute(
+                        f"DELETE FROM {table} WHERE {columns} IN (VALUES {rows})",
+                        [value for row in chunk for value in row],
+                    )
         return counts
 
     @classmethod
@@ -1636,6 +1643,8 @@ class SQLiteEventRepository:
 
 _MICROS = 1_000_000
 REJECTED_TEXT_CHARS = 300
+# Rows deleted per prune transaction: the write lock is held for well under a second.
+PRUNE_BATCH = 1_000
 # Rows that never own a text: legacy copies, and texts filtered for the item, not the text.
 _NOT_OWNERS = ("duplicate_content", *sorted(ITEM_REASONS))
 # Every sighting of the stories in {clusters}: each stored text at its own URL, and each exact

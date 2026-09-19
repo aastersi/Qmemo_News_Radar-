@@ -147,6 +147,7 @@ async def execute(
                 "deleted" if apply else "would_delete": counts,
                 "noise_retention_days": settings.raw_retention_days,
                 "evidence_retention_days": settings.retention_evidence_days,
+                "metrics_retention_days": settings.retention_metrics_days,
                 "kept_always": "events a person saw or acted on, their stories and copies",
             }
         )
@@ -188,6 +189,7 @@ async def execute(
                     "retention": {
                         "raw_retention_days": settings.raw_retention_days,
                         "evidence_retention_days": settings.retention_evidence_days,
+                        "metrics_retention_days": settings.retention_metrics_days,
                         "prunable": "qmemo-radar prune (dry run, counts per category)",
                         "automatic_deletion": False,
                     },
@@ -394,6 +396,7 @@ def _prune_cutoffs(settings: RadarSettings, now: datetime) -> PruneCutoffs:
         noise_before=now - timedelta(days=settings.raw_retention_days),
         evidence_before=now - timedelta(days=settings.retention_evidence_days),
         index_before=now - timedelta(hours=window),
+        metrics_before=now - timedelta(days=settings.retention_metrics_days),
     )
 
 

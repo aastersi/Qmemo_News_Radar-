@@ -71,6 +71,8 @@ class PruneCutoffs:
     evidence_before: datetime  # stored variants of a story and mentions of exact copies
     # Band keys of stories not seen since (the clustering window): a derived index only.
     index_before: datetime
+    # pipeline_metrics and finished pipeline_runs (counters of old runs).
+    metrics_before: datetime
 
 
 @dataclass(frozen=True, slots=True)

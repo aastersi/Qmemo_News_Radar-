@@ -65,6 +65,8 @@ class RadarSettings(BaseSettings):
     # Stored variants of a story and mentions of its exact copies: provenance while a story is
     # live (clustering looks back 48 h), prunable after this. `qmemo-radar prune --apply` only.
     retention_evidence_days: int = Field(default=7, ge=1, le=365)
+    # Flow counters (pipeline_metrics) and finished runs; the cost ledger is never pruned.
+    retention_metrics_days: int = Field(default=90, ge=30, le=3650)
 
     # Free sources: no key, no BudgetGuard. GDELT is off by default because it adds tens of
     # thousands of quotes per hour; RSS is on as soon as sources.yaml lists an enabled feed.
