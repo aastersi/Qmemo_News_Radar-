@@ -424,3 +424,64 @@ async def test_real_gdelt_and_rss_collectors_reach_telegram_through_free_ranking
     assert await review_service(repository, gateway).deliver(urgent=False) == 1
     assert gateway.cards[0][0].event.original_text == statement
     assert await repository.cost_since(month_start(datetime.now(UTC))) == Decimal(0)
+
+
+async def _crash_refresh_once(
+    repository: SQLiteEventRepository, monkeypatch: pytest.MonkeyPatch, source: Batches
+) -> None:
+    original = repository.refresh_clusters
+
+    async def crash(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(repository, "refresh_clusters", crash)
+    with pytest.raises(RuntimeError):
+        await radar(repository, source).run_once()
+    monkeypatch.setattr(repository, "refresh_clusters", original)
+
+
+async def test_copies_stored_by_a_failed_run_still_reach_the_story(
+    repository: SQLiteEventRepository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Independent review: aggregates stayed at 1 site forever after this crash.
+    copies = [quote(CLAIM, f"s{n}.example", 10 + n) for n in range(5)]
+    source = Batches([quote(CLAIM, "a.example", 1)], copies, copies, [])
+    await radar(repository, source).run_once()
+    await _crash_refresh_once(repository, monkeypatch, source)
+    await radar(repository, source).run_once()  # the same copies again: already known
+    await radar(repository, source).run_once()
+
+    assert query(repository, "SELECT mention_count, domain_count FROM event_clusters") == [(6, 6)]
+
+
+async def test_a_variant_joined_by_a_failed_run_still_reaches_the_story(
+    repository: SQLiteEventRepository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = Batches([quote(CLAIM, "a.example", 1)], [quote(CLAIM + " today", "b.example", 2)], [])
+    await radar(repository, source).run_once()
+    await _crash_refresh_once(repository, monkeypatch, source)
+    await radar(repository, source).run_once()
+
+    assert query(repository, "SELECT member_count, domain_count FROM event_clusters") == [(2, 2)]
+
+
+async def test_a_copy_filtered_for_its_age_does_not_own_the_fresh_copies(
+    repository: SQLiteEventRepository,
+) -> None:
+    # Independent review: one 3-hour-old copy turned 30 fresh copies into its mentions, and the
+    # story was never clustered or ranked.
+    old = quote(CLAIM, "old.example", 1).model_copy(
+        update={"published_at": NOW - timedelta(hours=3)}
+    )
+    fresh = [quote(CLAIM, f"s{n}.example", 10 + n) for n in range(30)]
+
+    await radar(repository, Batches([old, *fresh])).run_once()
+
+    rows = query(
+        repository, "SELECT external_id, status, filter_reason FROM radar_events ORDER BY rowid"
+    )
+    assert rows == [
+        ("old.example-1", "FILTERED_OUT", "too_old"),
+        ("s0.example-10", "SHORTLISTED", None),
+    ]
+    assert query(repository, "SELECT mention_count FROM event_clusters") == [(30,)]

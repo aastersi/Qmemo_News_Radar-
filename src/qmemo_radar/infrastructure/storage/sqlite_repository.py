@@ -9,6 +9,7 @@ from pathlib import Path
 
 import aiosqlite
 
+from qmemo_radar.application.filtering import ITEM_REASONS
 from qmemo_radar.application.normalization import comparison_text
 from qmemo_radar.application.ports import (
     ClusterJoin,
@@ -131,6 +132,18 @@ class SQLiteEventRepository:
                     for m in mentions
                 ],
             )
+            owners = sorted({mention.event_id for mention in mentions})
+            for chunk in _chunks(owners):
+                await db.execute(
+                    f"""
+                    UPDATE event_clusters SET preselect_score = -1
+                    WHERE id IN (
+                        SELECT cluster_id FROM radar_events
+                        WHERE id IN ({_placeholders(chunk)}) AND cluster_id IS NOT NULL
+                    )
+                    """,
+                    chunk,
+                )
             return inserted
 
     async def find_known(self, events: Sequence[EventCandidate]) -> KnownEvents:
@@ -165,10 +178,10 @@ class SQLiteEventRepository:
                     f"""
                     SELECT content_hash, id, MIN(rowid) FROM radar_events
                     WHERE content_hash IN ({_placeholders(hashes)})
-                      AND COALESCE(filter_reason, '') != 'duplicate_content'
+                      AND COALESCE(filter_reason, '') NOT IN ({_placeholders(_NOT_OWNERS)})
                     GROUP BY content_hash
                     """,
-                    hashes,
+                    [*hashes, *_NOT_OWNERS],
                 )
                 owners = {str(row[0]): str(row[1]) for row in rows}
             pairs = sorted(
@@ -413,15 +426,16 @@ class SQLiteEventRepository:
 
     async def has_earlier_content_duplicate(self, event: EventCandidate) -> bool:
         async with self._connect() as db:
+            # The same owner rule as find_known: an earlier row filtered for its item is no owner.
             rows = await db.execute_fetchall(
-                """
+                f"""
                 SELECT 1 FROM radar_events
                 WHERE content_hash = ?
                   AND rowid < (SELECT rowid FROM radar_events WHERE id = ?)
-                  AND COALESCE(filter_reason, '') != 'duplicate_content'
+                  AND COALESCE(filter_reason, '') NOT IN ({_placeholders(_NOT_OWNERS)})
                 LIMIT 1
                 """,
-                (event.content_hash, event.event_id),
+                (event.content_hash, event.event_id, *_NOT_OWNERS),
             )
         return bool(rows)
 
@@ -1141,7 +1155,15 @@ class SQLiteEventRepository:
                     for join in joins
                 ],
             )
-            return db.total_changes - before
+            attached = db.total_changes - before
+            await db.executemany(
+                "UPDATE event_clusters SET preselect_score = -1 WHERE representative_event_id = ?",
+                [
+                    (representative,)
+                    for representative in {j.representative_event_id for j in joins}
+                ],
+            )
+            return attached
 
     async def clusters_of(self, event_ids: Sequence[str]) -> set[int]:
         found: set[int] = set()
@@ -1158,8 +1180,8 @@ class SQLiteEventRepository:
     async def unscored_clusters(self, *, limit: int) -> set[int]:
         async with self._connect() as db:
             rows = await db.execute_fetchall(
-                "SELECT id FROM event_clusters WHERE state = 'candidate' AND preselect_score = -1 "
-                "ORDER BY id LIMIT ?",
+                "SELECT id FROM event_clusters INDEXED BY idx_clusters_dirty "
+                "WHERE preselect_score = -1 ORDER BY id LIMIT ?",
                 (limit,),
             )
         return {int(row[0]) for row in rows}
@@ -1614,6 +1636,8 @@ class SQLiteEventRepository:
 
 _MICROS = 1_000_000
 REJECTED_TEXT_CHARS = 300
+# Rows that never own a text: legacy copies, and texts filtered for the item, not the text.
+_NOT_OWNERS = ("duplicate_content", *sorted(ITEM_REASONS))
 # Every sighting of the stories in {clusters}: each stored text at its own URL, and each exact
 # copy of it elsewhere. Columns: cluster, text, domain, source key, time.
 _SIGHTINGS = """

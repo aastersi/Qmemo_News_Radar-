@@ -134,7 +134,7 @@ class SelectionRepository(Protocol):
     async def clusters_of(self, event_ids: Sequence[str]) -> set[int]: ...
 
     async def unscored_clusters(self, *, limit: int) -> set[int]:
-        """Stories created but never scored (the run that created them failed)."""
+        """Stories to (re)score: new, or grown since their last score (also by a failed run)."""
         ...
 
     async def refresh_clusters(

@@ -5,6 +5,8 @@ from datetime import UTC, datetime, timedelta
 from qmemo_radar.domain import EventCandidate
 
 MANUAL_SOURCE_KEY = "manual"
+# Reasons about the item, not its text: another copy of the same text may pass them.
+ITEM_REASONS = frozenset({"too_old", "blocked_author"})
 _NOISE = re.compile(r"https?://\S+|[@#$]\w+")
 
 

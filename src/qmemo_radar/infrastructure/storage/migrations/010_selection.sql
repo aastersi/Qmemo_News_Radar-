@@ -18,7 +18,8 @@ CREATE TABLE event_clusters (
     article TEXT,
     -- candidate | preselected | sibling (another quote of a preselected article) | boilerplate
     state TEXT NOT NULL DEFAULT 'candidate',
-    -- -1 until scored: a run that failed after clustering leaves these for the next run.
+    -- -1 = to be scored: new, or grown by a copy or variant since its last score. Set in the
+    -- transaction that stores the copy or variant, so a failed run leaves it for the next.
     preselect_score INTEGER NOT NULL DEFAULT -1,
     -- Breakdown and notes, kept only for preselected and boilerplate stories.
     preselect_json TEXT NOT NULL DEFAULT '{}',
@@ -29,6 +30,8 @@ CREATE TABLE event_clusters (
 CREATE INDEX idx_clusters_state_score ON event_clusters(state, preselect_score DESC);
 CREATE INDEX idx_clusters_last_seen ON event_clusters(last_seen_at);
 CREATE INDEX idx_clusters_article ON event_clusters(article) WHERE state = 'preselected';
+-- Stories to (re)score: new, or grown by a copy or variant stored in the same transaction.
+CREATE INDEX idx_clusters_dirty ON event_clusters(id) WHERE preselect_score = -1;
 
 ALTER TABLE radar_events ADD COLUMN cluster_id INTEGER
     REFERENCES event_clusters(id) ON DELETE SET NULL;

@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from uuid import uuid4
 
 from qmemo_radar.application.filtering import (
+    ITEM_REASONS,
     MANUAL_SOURCE_KEY,
     FilterPolicy,
     first_filter_reason,
@@ -300,7 +301,10 @@ class RadarPipeline:
                     run.grown.add(original)
                     stats[Metric.MENTIONS_AGGREGATED] += 1
                 continue
-            owners.setdefault(event.content_hash, event.event_id)
+            if reason not in ITEM_REASONS:
+                # A text rejected only for this item (too old, blocked author) must not own the
+                # text: a later clean copy would become its mention and never be ranked.
+                owners.setdefault(event.content_hash, event.event_id)
             if reason:
                 # Kept, not dropped: retention prunes noise later.
                 event = event.model_copy(
@@ -373,7 +377,7 @@ class RadarPipeline:
             await self._repository.save_clustering(new_clusters, joins, now=now)
             touched |= await self._repository.clusters_of([event.event_id for event in batch])
 
-        # Stories of a run that failed after clustering; this run's own are scored below anyway.
+        # Stories grown or created since their last score, including by a run that failed.
         touched |= await self._repository.unscored_clusters(limit=MAX_CLUSTERED_PER_RUN)
         scores: list[ClusterScore] = []
         reopen: list[str] = []
